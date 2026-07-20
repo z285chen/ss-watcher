@@ -1,0 +1,33 @@
+{
+  "name": "ss-watcher",
+  "version": "0.2.0-m2",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit && vite build",
+    "dev": "vite",
+    "m0:server": "node tools/m0-server.mjs",
+    "m1:server": "node tools/m0-server.mjs",
+    "m2:server": "node tools/m0-server.mjs",
+    "test": "vitest run",
+    "test:m0-network": "vitest run tests/integration/request-policy-server.test.ts --reporter=verbose",
+    "test:m0-shopify-live": "vitest run tests/integration/shopify-live.test.ts --reporter=verbose",
+    "test:m1-network": "vitest run tests/integration/request-policy-server.test.ts --reporter=verbose",
+    "test:m1-shopify-live": "vitest run tests/integration/shopify-live.test.ts --reporter=verbose",
+    "test:m2-network": "vitest run tests/integration/request-policy-server.test.ts --reporter=verbose",
+    "test:m2-shopify-live": "vitest run tests/integration/shopify-live.test.ts --reporter=verbose",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "vue": "^3.5.40"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.2.2",
+    "@types/node": "^26.1.1",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "fake-indexeddb": "^6.2.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.1.5",
+    "vitest": "^4.1.10"
+  }
+}
