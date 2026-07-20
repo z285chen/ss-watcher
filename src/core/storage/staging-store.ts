@@ -251,9 +251,7 @@ export class StagingStore {
       throw new StagingStoreError("IndexedDB is not available in this context");
     }
 
-    // Preserve the pre-SS-Watcher namespace so existing local committed
-    // snapshots remain readable after the product rename.
-    this.databaseName = options.databaseName ?? "shopify-store-inspector";
+    this.databaseName = options.databaseName ?? "ss-watcher";
     this.factory = factory;
     this.schemaVersion = options.schemaVersion ?? DEFAULT_SCHEMA_VERSION;
     this.now = options.now ?? Date.now;
