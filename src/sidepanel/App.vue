@@ -7,7 +7,10 @@ import {
   watch,
 } from "vue";
 
-import { routeRootFromShopifyProbe } from "../content/probes";
+import {
+  routeRootFromShopifyProbe,
+  type CollectorSocialPlatform,
+} from "../content/probes";
 import {
   productFacets,
   queryProducts,
@@ -52,6 +55,16 @@ import type {
 } from "../shared/messages";
 
 type ViewName = "overview" | "products" | "diagnostics";
+type SnapshotStoreProfile = Readonly<{ favicon?: string }>;
+type SnapshotTheme = Readonly<{
+  name?: string;
+  schemaName?: string;
+  id?: string;
+}>;
+type SnapshotSocialLink = Readonly<{
+  platform: CollectorSocialPlatform;
+  url: string;
+}>;
 
 const status = ref("等待当前标签页授权…");
 const detail = ref("");
@@ -108,6 +121,10 @@ const storeInitial = computed(() => (storeHost.value[0] ?? "S").toUpperCase());
 const snapshotTime = computed(() =>
   displaySnapshotTime(currentBundle.value?.snapshot.scannedAt),
 );
+const storeProfile = computed(() => storeProfileFromBundle(currentBundle.value));
+const theme = computed(() => themeFromBundle(currentBundle.value));
+const themeLabel = computed(() => displayTheme(theme.value));
+const socialLinks = computed(() => socialsFromBundle(currentBundle.value));
 
 watch(
   [
@@ -625,6 +642,116 @@ function coverageFromBundle(
   };
 }
 
+function storeProfileFromBundle(
+  bundle: CommittedSnapshotBundle | undefined,
+): SnapshotStoreProfile | undefined {
+  const value = bundle?.snapshot.store;
+  if (!isRecord(value)) return undefined;
+  const favicon = cleanSnapshotUrl(value.favicon);
+  return favicon === undefined ? {} : { favicon };
+}
+
+function themeFromBundle(
+  bundle: CommittedSnapshotBundle | undefined,
+): SnapshotTheme | undefined {
+  const value = bundle?.snapshot.theme;
+  if (!isRecord(value)) return undefined;
+  const name = clippedText(value.name, 256);
+  const schemaName = clippedText(value.schemaName, 256);
+  const id = clippedText(value.id, 64);
+  return name === undefined && schemaName === undefined && id === undefined
+    ? undefined
+    : {
+        ...(name === undefined ? {} : { name }),
+        ...(schemaName === undefined ? {} : { schemaName }),
+        ...(id === undefined ? {} : { id }),
+      };
+}
+
+function socialsFromBundle(
+  bundle: CommittedSnapshotBundle | undefined,
+): SnapshotSocialLink[] {
+  const value = bundle?.snapshot.socials;
+  if (!Array.isArray(value)) return [];
+  const platforms = new Set<CollectorSocialPlatform>([
+    "instagram",
+    "facebook",
+    "tiktok",
+    "youtube",
+    "x",
+    "pinterest",
+    "linkedin",
+    "threads",
+  ]);
+  const seen = new Set<CollectorSocialPlatform>();
+  const result: SnapshotSocialLink[] = [];
+  for (const entry of value.slice(0, 12)) {
+    if (!isRecord(entry) || typeof entry.platform !== "string") continue;
+    if (!platforms.has(entry.platform as CollectorSocialPlatform)) continue;
+    const platform = entry.platform as CollectorSocialPlatform;
+    const url = cleanSnapshotUrl(entry.url);
+    if (url === undefined || seen.has(platform)) continue;
+    seen.add(platform);
+    result.push({ platform, url });
+  }
+  return result;
+}
+
+function cleanSnapshotUrl(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0 || value.length > 2_048) {
+    return undefined;
+  }
+  try {
+    const url = new URL(value);
+    if (
+      (url.protocol !== "http:" && url.protocol !== "https:") ||
+      url.username.length > 0 ||
+      url.password.length > 0
+    ) {
+      return undefined;
+    }
+    return url.href;
+  } catch {
+    return undefined;
+  }
+}
+
+function clippedText(value: unknown, maximum: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  return normalized.length === 0 ? undefined : normalized.slice(0, maximum);
+}
+
+function displayTheme(value: SnapshotTheme | undefined): string {
+  if (value?.name !== undefined && value.schemaName !== undefined) {
+    return value.name.localeCompare(value.schemaName, undefined, {
+      sensitivity: "accent",
+    }) === 0
+      ? value.name
+      : `${value.name} · ${value.schemaName}`;
+  }
+  return value?.name ?? value?.schemaName ?? "未识别";
+}
+
+function socialLabel(platform: CollectorSocialPlatform): string {
+  const labels: Record<CollectorSocialPlatform, string> = {
+    instagram: "Instagram",
+    facebook: "Facebook",
+    tiktok: "TikTok",
+    youtube: "YouTube",
+    x: "X",
+    pinterest: "Pinterest",
+    linkedin: "LinkedIn",
+    threads: "Threads",
+  };
+  return labels[platform];
+}
+
+function hideBrokenImage(event: Event): void {
+  const target = event.currentTarget;
+  if (target instanceof HTMLImageElement) target.hidden = true;
+}
+
 function productUrl(product: CatalogProduct): string | undefined {
   if (product.canonicalUrl !== undefined) return product.canonicalUrl;
   return product.handle === undefined || sessionOrigin.value === ""
@@ -846,10 +973,23 @@ onBeforeUnmount(() => {
 
     <section v-if="currentBundle && context" class="store-summary">
       <div class="store-identity">
-        <span class="store-avatar">{{ storeInitial }}</span>
+        <span class="store-avatar">
+          {{ storeInitial }}
+          <img
+            v-if="storeProfile?.favicon"
+            :src="storeProfile.favicon"
+            alt=""
+            referrerpolicy="no-referrer"
+            @error="hideBrokenImage"
+          />
+        </span>
         <div>
           <strong>{{ storeHost }}</strong>
           <small>上次扫描 {{ snapshotTime }}</small>
+          <span class="theme-detail" :title="themeLabel">
+            <UiIcon name="layers" :size="12" />
+            主题 · {{ themeLabel }}
+          </span>
         </div>
       </div>
       <span
@@ -859,12 +999,27 @@ onBeforeUnmount(() => {
         <UiIcon name="shield" :size="14" />
         {{ !handle ? "只读快照" : context.priceContextVerified ? "价格已验证" : "价格待验证" }}
       </span>
-      <div class="context-chips">
-        <span>{{ context.storefrontKind }}</span>
-        <span>{{ context.locale ?? "locale?" }}</span>
-        <span>{{ context.country ?? "country?" }}</span>
-        <span>{{ context.currency ?? "currency?" }}</span>
-        <span v-if="coverage?.truncated" class="warning">结果已截断</span>
+      <div class="context-summary">
+        <span class="context-market">
+          市场 · {{ context.country ?? "未知" }} · {{ context.currency ?? "未知" }}
+        </span>
+        <span v-if="coverage?.truncated" class="context-warning">结果已截断</span>
+      </div>
+      <div class="social-list">
+        <span class="social-caption">社交媒体</span>
+        <template v-if="socialLinks.length > 0">
+          <a
+            v-for="social in socialLinks"
+            :key="social.platform"
+            :href="social.url"
+            target="_blank"
+            rel="noopener noreferrer"
+            :title="social.url"
+          >
+            {{ socialLabel(social.platform) }}
+          </a>
+        </template>
+        <span v-else class="social-empty">未发现公开账号</span>
       </div>
     </section>
 

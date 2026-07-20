@@ -152,13 +152,30 @@ export type CollectorProbeResult =
       ok: true;
       canonical?: string;
       generator?: string;
+      favicon?: string;
       scriptUrls: string[];
       linkUrls: string[];
       checkoutUrls: string[];
       jsonLdCount: number;
       pageProducts: CollectorPageProduct[];
       collectionHandles: string[];
+      socials: CollectorSocialLink[];
     };
+
+export type CollectorSocialPlatform =
+  | "instagram"
+  | "facebook"
+  | "tiktok"
+  | "youtube"
+  | "x"
+  | "pinterest"
+  | "linkedin"
+  | "threads";
+
+export type CollectorSocialLink = Readonly<{
+  platform: CollectorSocialPlatform;
+  url: string;
+}>;
 
 export type CollectorPageProductSource = "canonical" | "dom" | "json-ld";
 
@@ -207,6 +224,8 @@ export function collectorProbe(input: {
 
   const linkUrls: string[] = [];
   let linkUrlBytes = 0;
+  let favicon: string | undefined;
+  let faviconScore = -1;
   const links = document.querySelectorAll<HTMLLinkElement>("link[href]");
   for (let index = 0; index < Math.min(links.length, 200); index += 1) {
     const link = links[index];
@@ -217,6 +236,11 @@ export function collectorProbe(input: {
     if (linkUrlBytes + bytes > 24 * 1_024 || linkUrls.length >= 100) break;
     linkUrls.push(cleaned);
     linkUrlBytes += bytes;
+    const score = scoreFaviconLink(link);
+    if (score > faviconScore) {
+      favicon = cleaned;
+      faviconScore = score;
+    }
   }
 
   // Checkout hand-offs are useful for distinguishing a Shopify commerce
@@ -224,6 +248,7 @@ export function collectorProbe(input: {
   // signal; never return arbitrary anchors or their query strings.
   const checkoutUrls: string[] = [];
   const collectionHandles = new Set<string>();
+  const socialMap = new Map<CollectorSocialPlatform, string>();
   const pageProductMap = new Map<string, CollectorPageProduct>();
   let returnedImageCount = 0;
   let returnedImageBytes = 0;
@@ -241,6 +266,10 @@ export function collectorProbe(input: {
     if (anchor === undefined) continue;
     const cleaned = cleanPublicUrl(anchor.href);
     if (cleaned === undefined) continue;
+    const platform = socialPlatform(cleaned);
+    if (platform !== undefined && socialMap.size < 12) {
+      socialMap.set(platform, cleaned);
+    }
     if (isShopifyCheckoutUrl(cleaned)) {
       const bytes = new TextEncoder().encode(cleaned).byteLength;
       if (checkoutUrlBytes + bytes <= 8 * 1_024 && checkoutUrls.length < 20) {
@@ -281,13 +310,88 @@ export function collectorProbe(input: {
     ok: true,
     ...(canonical ? { canonical } : {}),
     ...(generator ? { generator: generator.slice(0, 256) } : {}),
+    ...(favicon === undefined ? {} : { favicon }),
     scriptUrls,
     linkUrls,
     checkoutUrls,
     jsonLdCount,
     pageProducts: [...pageProductMap.values()],
     collectionHandles: [...collectionHandles],
+    socials: [...socialMap].map(([platform, url]) => ({ platform, url })),
   };
+
+  function scoreFaviconLink(link: HTMLLinkElement): number {
+    const rel = typeof link.rel === "string" ? link.rel.toLowerCase() : "";
+    if (
+      !/(?:^|\s)icon(?:\s|$)|apple-touch-icon|mask-icon/u.test(rel)
+    ) {
+      return -1;
+    }
+    const type = typeof link.type === "string" ? link.type.toLowerCase() : "";
+    const sizes =
+      typeof link.sizes?.value === "string" ? link.sizes.value : "";
+    const dimensions = [...sizes.matchAll(/(\d{1,4})x(\d{1,4})/gu)];
+    const largest = dimensions.reduce(
+      (maximum, match) =>
+        Math.max(maximum, Number(match[1] ?? 0), Number(match[2] ?? 0)),
+      0,
+    );
+    if (type === "image/svg+xml" || link.href.toLowerCase().endsWith(".svg")) {
+      return 1_000;
+    }
+    if (largest > 0) return Math.min(largest, 512);
+    if (rel.includes("apple-touch-icon")) return 180;
+    if (rel.includes("mask-icon")) return 64;
+    return 32;
+  }
+
+  function socialPlatform(value: string): CollectorSocialPlatform | undefined {
+    try {
+      const url = new URL(value);
+      const hostname = url.hostname.toLowerCase().replace(/^www\./u, "");
+      const pathname = url.pathname.toLowerCase();
+      if (hostname === "instagram.com" || hostname.endsWith(".instagram.com")) {
+        return /^\/(?:p|reel|stories|explore)(?:\/|$)/u.test(pathname)
+          ? undefined
+          : "instagram";
+      }
+      if (hostname === "facebook.com" || hostname.endsWith(".facebook.com")) {
+        return /^\/(?:sharer|share|dialog)(?:\/|$)/u.test(pathname)
+          ? undefined
+          : "facebook";
+      }
+      if (hostname === "tiktok.com" || hostname.endsWith(".tiktok.com")) {
+        return pathname.includes("/video/") ? undefined : "tiktok";
+      }
+      if (hostname === "youtube.com" || hostname.endsWith(".youtube.com")) {
+        return /^\/(?:watch|shorts|embed)(?:\/|$)/u.test(pathname)
+          ? undefined
+          : "youtube";
+      }
+      if (hostname === "x.com" || hostname === "twitter.com") {
+        return /^\/(?:intent|share|i\/status)(?:\/|$)/u.test(pathname) ||
+          pathname.includes("/status/")
+          ? undefined
+          : "x";
+      }
+      if (hostname === "pinterest.com" || hostname.endsWith(".pinterest.com")) {
+        return /^\/(?:pin|pin-builder)(?:\/|$)/u.test(pathname)
+          ? undefined
+          : "pinterest";
+      }
+      if (hostname === "linkedin.com" || hostname.endsWith(".linkedin.com")) {
+        return /^\/(?:sharing|feed|posts)(?:\/|$)/u.test(pathname)
+          ? undefined
+          : "linkedin";
+      }
+      if (hostname === "threads.net" || hostname.endsWith(".threads.net")) {
+        return pathname.startsWith("/@") ? "threads" : undefined;
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }
 
   function addPageProduct(
     rawUrl: string,

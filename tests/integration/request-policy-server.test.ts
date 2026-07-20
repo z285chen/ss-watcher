@@ -161,6 +161,7 @@ liveDescribe("RequestPolicy against the live M0 dual-port fixture", () => {
         jsonLdCount: 0,
         pageProducts: [],
         collectionHandles: [],
+        socials: [],
       },
       execute,
     });

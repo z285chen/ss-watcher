@@ -138,6 +138,7 @@ describe("collectorProbe", () => {
         },
       ],
       collectionHandles: [],
+      socials: [],
     });
   });
 
@@ -212,6 +213,66 @@ describe("collectorProbe", () => {
     });
     expect(JSON.stringify(result)).not.toContain("99.00");
     expect(JSON.stringify(result)).not.toContain("customer");
+  });
+
+  it("selects the best favicon and keeps only deduplicated social profiles", () => {
+    vi.stubGlobal("location", {
+      origin: "https://store.example",
+      pathname: "/",
+      href: "https://store.example/",
+    });
+    vi.stubGlobal("document", {
+      querySelector: () => undefined,
+      scripts: [],
+      querySelectorAll: (selector: string) => {
+        if (selector === "link[href]") {
+          return [
+            {
+              href: "https://store.example/favicon-32.png?v=1",
+              rel: "icon",
+              type: "image/png",
+              sizes: { value: "32x32" },
+            },
+            {
+              href: "https://cdn.example/store-icon.svg?cache=2",
+              rel: "icon",
+              type: "image/svg+xml",
+              sizes: { value: "any" },
+            },
+          ];
+        }
+        if (selector === "a[href]") {
+          return [
+            { href: "https://www.instagram.com/store/?hl=en" },
+            { href: "https://instagram.com/store/#duplicate" },
+            { href: "https://x.com/store?ref=footer" },
+            { href: "https://x.com/intent/post?text=share" },
+            { href: "https://www.youtube.com/watch?v=private" },
+            { href: "https://www.youtube.com/@store?sub_confirmation=1" },
+            { href: "https://www.facebook.com/sharer/sharer.php?u=private" },
+          ];
+        }
+        return [];
+      },
+    });
+
+    const result = collectorProbe({
+      expectedOrigin: "https://store.example",
+      expectedPathname: "/",
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      favicon: "https://cdn.example/store-icon.svg",
+      socials: [
+        { platform: "instagram", url: "https://instagram.com/store/" },
+        { platform: "x", url: "https://x.com/store" },
+        { platform: "youtube", url: "https://www.youtube.com/@store" },
+      ],
+    });
+    expect(JSON.stringify(result)).not.toContain("intent");
+    expect(JSON.stringify(result)).not.toContain("watch");
+    expect(JSON.stringify(result)).not.toContain("sharer");
   });
 
   it("rejects locale-prefixed sensitive and ambiguous paths before DOM access", () => {

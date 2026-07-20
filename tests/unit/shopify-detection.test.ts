@@ -183,6 +183,7 @@ function collector(
     jsonLdCount: 0,
     pageProducts: [],
     collectionHandles: [],
+    socials: [],
     ...overrides,
   };
 }

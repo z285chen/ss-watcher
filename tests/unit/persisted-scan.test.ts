@@ -78,11 +78,17 @@ describe("persisted M1+M2 storefront scan", () => {
       main: {
         shop: "fixture.myshopify.com",
         routeRoot: "/",
+        themeName: "Copy of Impact",
         themeId: 1,
+        themeSchemaName: "Impact",
       },
       collector: collector({
+        favicon: "https://store.example/favicon.svg",
         linkUrls: [
           "https://cdn.shopify.com/s/files/1/0000/t/1/assets/theme.css",
+        ],
+        socials: [
+          { platform: "instagram", url: "https://instagram.com/fixture" },
         ],
       }),
       execute,
@@ -110,6 +116,15 @@ describe("persisted M1+M2 storefront scan", () => {
       },
       analysisStatus: "completed",
       statistics: { productCount: 2, variantCount: 2 },
+      store: {
+        domain: "store.example",
+        myshopifyDomain: "fixture.myshopify.com",
+        favicon: "https://store.example/favicon.svg",
+      },
+      theme: { name: "Copy of Impact", id: "1", schemaName: "Impact" },
+      socials: [
+        { platform: "instagram", url: "https://instagram.com/fixture" },
+      ],
       rankings: [
         expect.objectContaining({
           rank: 1,
@@ -156,7 +171,15 @@ describe("persisted M1+M2 storefront scan", () => {
     const reopened = new StagingStore({ databaseName: store.databaseName });
     stores.push(reopened);
     await expect(reopened.getLatestCommittedSnapshot(origin)).resolves.toMatchObject({
-      snapshot: { snapshotId: result.snapshotId, committed: true },
+      snapshot: {
+        snapshotId: result.snapshotId,
+        committed: true,
+        store: { favicon: "https://store.example/favicon.svg" },
+        theme: { name: "Copy of Impact", schemaName: "Impact" },
+        socials: [
+          { platform: "instagram", url: "https://instagram.com/fixture" },
+        ],
+      },
       products: [{ snapshotId: result.snapshotId }, { snapshotId: result.snapshotId }],
     });
   });
@@ -377,6 +400,7 @@ function collector(
     jsonLdCount: 0,
     pageProducts: [],
     collectionHandles: [],
+    socials: [],
     ...overrides,
   };
 }

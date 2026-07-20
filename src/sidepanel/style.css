@@ -101,7 +101,8 @@ a {
 .store-identity,
 .topbar-actions,
 .status-strip,
-.context-chips,
+.context-summary,
+.social-list,
 .trust-badge,
 .view-heading,
 .card-heading > div,
@@ -290,11 +291,23 @@ a {
 }
 
 .store-avatar {
+  position: relative;
+  overflow: hidden;
   flex: 0 0 38px;
   width: 38px;
   height: 38px;
+  border: 1px solid var(--line);
   border-radius: 11px;
   font-size: 15px;
+}
+
+.store-avatar img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #fff;
 }
 
 .store-identity > div {
@@ -317,6 +330,23 @@ a {
   font-size: 10px;
 }
 
+.theme-detail {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 4px;
+  overflow: hidden;
+  color: #59647b;
+  font-size: 10px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.theme-detail svg {
+  flex: 0 0 auto;
+}
+
 .trust-badge {
   align-self: start;
   gap: 4px;
@@ -334,13 +364,13 @@ a {
   background: var(--warning-soft);
 }
 
-.context-chips {
+.context-summary {
   grid-column: 1 / -1;
+  align-items: center;
   flex-wrap: wrap;
   gap: 5px;
 }
 
-.context-chips span,
 .data-pill,
 .result-count,
 .product-badges span,
@@ -350,17 +380,60 @@ a {
   font-weight: 650;
 }
 
-.context-chips span {
-  padding: 4px 7px;
-  color: #667086;
-  border: 1px solid var(--line);
-  background: #fafbfc;
+.context-market,
+.context-warning {
+  font-size: 10px;
+  font-weight: 650;
 }
 
-.context-chips span.warning {
+.context-market {
+  color: var(--subtle);
+}
+
+.context-warning {
+  padding: 3px 6px;
   color: var(--warning);
-  border-color: #f2d4aa;
+  border: 1px solid #f2d4aa;
+  border-radius: 999px;
   background: var(--warning-soft);
+}
+
+.social-list {
+  grid-column: 1 / -1;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.social-caption,
+.social-empty,
+.social-list a {
+  font-size: 10px;
+}
+
+.social-caption {
+  margin-right: 2px;
+  color: var(--subtle);
+  font-weight: 680;
+}
+
+.social-list a {
+  padding: 4px 7px;
+  color: var(--accent-strong);
+  border: 1px solid #dfe2ff;
+  border-radius: 999px;
+  background: #f6f7ff;
+  font-weight: 680;
+  text-decoration: none;
+}
+
+.social-list a:hover {
+  border-color: #bfc5ff;
+  background: #eceeff;
+}
+
+.social-empty {
+  color: var(--subtle);
 }
 
 .app-nav {
@@ -1286,7 +1359,11 @@ pre {
     justify-self: start;
   }
 
-  .context-chips {
+  .context-summary {
+    grid-column: auto;
+  }
+
+  .social-list {
     grid-column: auto;
   }
 

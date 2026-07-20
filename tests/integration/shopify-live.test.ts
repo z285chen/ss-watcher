@@ -40,6 +40,7 @@ liveDescribe("approved live Shopify evidence", () => {
         jsonLdCount: 0,
         pageProducts: [],
         collectionHandles: [],
+        socials: [],
       },
       execute,
       productLimit: 10,

@@ -221,6 +221,9 @@ export async function runPersistedStorefrontScan(
         ...(input.main?.shop === undefined
           ? {}
           : { myshopifyDomain: input.main.shop }),
+        ...(!input.collector.ok || input.collector.favicon === undefined
+          ? {}
+          : { favicon: input.collector.favicon }),
       },
       ...(input.main?.themeName === undefined &&
       input.main?.themeId === undefined &&
@@ -242,7 +245,7 @@ export async function runPersistedStorefrontScan(
       rankings: rankingRows,
       newness: analysis.newness.candidates,
       apps: [],
-      socials: [],
+      socials: input.collector.ok ? input.collector.socials : [],
       errors: analysisErrors,
     });
     const committed = await input.store.commitRun(scanRunId);

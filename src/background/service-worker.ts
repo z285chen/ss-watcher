@@ -493,6 +493,7 @@ function isCollectorProbeResult(value: unknown): value is CollectorProbeResult {
         !value.canonical.includes("#"))) &&
     (value.generator === undefined ||
       (typeof value.generator === "string" && value.generator.length <= 256)) &&
+    (value.favicon === undefined || isCleanPublicUrl(value.favicon)) &&
     Array.isArray(value.scriptUrls) &&
     value.scriptUrls.length <= 100 &&
     value.scriptUrls.every(
@@ -533,7 +534,30 @@ function isCollectorProbeResult(value: unknown): value is CollectorProbeResult {
       (item) =>
         typeof item === "string" &&
         /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,254}$/u.test(item),
-    )
+    ) &&
+    Array.isArray(value.socials) &&
+    value.socials.length <= 12 &&
+    value.socials.every(isCollectorSocialLink)
+  );
+}
+
+function isCollectorSocialLink(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  const allowedPlatforms = new Set([
+    "instagram",
+    "facebook",
+    "tiktok",
+    "youtube",
+    "x",
+    "pinterest",
+    "linkedin",
+    "threads",
+  ]);
+  return (
+    Object.keys(value).every((key) => key === "platform" || key === "url") &&
+    typeof value.platform === "string" &&
+    allowedPlatforms.has(value.platform) &&
+    isCleanPublicUrl(value.url)
   );
 }
 
