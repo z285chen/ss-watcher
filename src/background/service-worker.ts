@@ -38,11 +38,20 @@ import type {
   ResourceFetchResult,
 } from "../core/frontend/resource-types";
 import { ResourceScanBudgetRegistry } from "./resource-scan-budget";
+import { SidePanelBindingController } from "./side-panel-binding";
 
 const bootId = crypto.randomUUID();
 const sessionManager = new SessionManager(createSessionApi());
 const inFlightRequests = new InFlightRequestRegistry();
 const resourceBudgets = new ResourceScanBudgetRegistry();
+const sidePanelBinding = new SidePanelBindingController({
+  sidePanel: chrome.sidePanel,
+  tabs: {
+    query: async () =>
+      (await chrome.tabs.query({})).map((tab) => ({ id: tab.id })),
+  },
+  storage: chrome.storage.session,
+});
 
 void configureExtension();
 
@@ -60,18 +69,19 @@ chrome.action.onClicked.addListener((tab) => {
     return;
   }
 
-  // Keep sidePanel.open() directly inside the action event turn. Chrome grants
-  // activeTab for this explicit action invocation; the panel then performs the
-  // minimal probe and binds its own nonce before any privileged operation.
-  void openPanelFromAction(tabId, windowId);
+  // openForTab() dispatches setOptions() and sidePanel.open() before its first
+  // await, preserving this explicit action's user gesture and activeTab grant.
+  void openPanelFromAction(tabId, windowId, tab.url);
 });
 
 chrome.runtime.onInstalled.addListener(() => {
   void configureExtension();
+  void sidePanelBinding.disableAllTabs();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   void configureExtension();
+  void sidePanelBinding.disableAllTabs();
   void sessionManager.purgeExpired();
 });
 
@@ -87,12 +97,16 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     resourceBudgets.cancelTab(tabId);
     void sessionManager.revokeByTab(tabId);
   }
+  if (changeInfo.url !== undefined) {
+    void sidePanelBinding.handleNavigation(tabId, changeInfo.url);
+  }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   inFlightRequests.cancelTab(tabId);
   resourceBudgets.cancelTab(tabId);
   void sessionManager.revokeByTab(tabId);
+  void sidePanelBinding.disableTab(tabId);
 });
 
 chrome.windows.onRemoved.addListener((windowId) => {
@@ -134,6 +148,7 @@ async function configureExtension(): Promise<void> {
     // An explicit action handler is required so the activeTab grant and panel
     // opening share the same trusted user gesture on every supported Chrome.
     chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }),
+    sidePanelBinding.disableGlobalPanel(),
     chrome.storage.session.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" }),
   ]);
 }
@@ -141,12 +156,10 @@ async function configureExtension(): Promise<void> {
 async function openPanelFromAction(
   tabId: number,
   windowId: number,
+  url: string | undefined,
 ): Promise<void> {
-  try {
-    await chrome.sidePanel.open({ windowId });
-  } catch {
-    return;
-  }
+  const opened = await sidePanelBinding.openForTab(tabId, url);
+  if (!opened) return;
 
   const notice: M0ActionAuthorizedNotice = {
     type: "M0_ACTION_AUTHORIZED",

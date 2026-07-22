@@ -1,6 +1,6 @@
 # SS Watcher — 自用 Chrome 扩展设计方案
 
-> 状态：Draft v0.3.5（M0–M3 COMPLETE；下一阶段为 M4 本地历史观测）
+> 状态：Draft v0.3.6（M0–M3 COMPLETE；下一阶段为 M4 本地历史观测）
 > 日期：2026-07-22
 > 基线：方案 B（本机加载的 Manifest V3 解压扩展）
 
@@ -50,6 +50,10 @@
   - fixture 实机暴露并修复动态派生 map 队列的并发游标竞态；新增稳定复现测试后全量为 256 passed / 15 skipped。
   - fixture JS/CSS map UI、完整 JSON lineage/MIME/hash/raw-source 门禁及 5 文件显式源码包全部通过；跨源导出 0、`changedSinceScan=0`。
   - Elfin 取消保留旧快照且清空 capability，重扫恢复；稳定规则识别 3 个 Pixel，同资源双信号可见，所有跨源资源保持 metadata-only。
+- v0.3.6（2026-07-22）：将 Side Panel 从窗口级常驻改为唯一标签页绑定：
+  - action 点击在同一用户手势回合内依次派发 `setOptions({tabId, enabled:true})` 与 `open({tabId})`，不再使用窗口级 `open({windowId})`。
+  - 切换到其他标签时原生隐藏，切回已绑定标签时恢复；在另一标签再次点击图标会关闭旧标签的 panel capability 并移动唯一绑定。
+  - 同 origin 店铺导航保留面板，跨 origin 导航、标签关闭、扩展重载或浏览器启动清理绑定；ScanSession 的切换/导航吊销规则保持不变。
 
 ## 1. 结论
 
@@ -415,14 +419,22 @@ type ScanSession = {
 ```ts
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false });
 chrome.action.onClicked.addListener((tab) => {
-  if (tab.id !== undefined && tab.windowId !== undefined) {
-    void chrome.sidePanel.open({ windowId: tab.windowId });
+  if (tab.id !== undefined) {
+    // 两个调用均在首次 await 之前派发，保留 action 用户手势。
+    const configured = chrome.sidePanel.setOptions({
+      tabId: tab.id,
+      path: "sidepanel/index.html",
+      enabled: true,
+    });
+    const opened = chrome.sidePanel.open({ tabId: tab.id });
+    void Promise.allSettled([configured, opened]);
   }
 });
 ```
 
 - `sidePanel.open()` 自 Chrome 116 起可用并要求用户手势，因此 manifest 的 `minimum_chrome_version` 冻结为 116。
-- action handler 必须在事件回合内直接调用 `sidePanel.open()`；不得先等待异步预检。新面板自行发送候选 EstablishSession；已经打开的面板由 action handler 的无凭证通知触发重试。通知指向另一标签页时必须重建会话；指向同一标签页且已有句柄时，先用不读取页面正文的最小会话校验确认 documentId，校验通过则保留现有 resource capability，失效才重建。两条路径都**不把面板加载或通知当成点击证明**：只有 §8.3 的最小授权探针成功后才签发会话。
+- manifest 的全局 `default_path` 在初始化时通过 `setOptions({enabled:false})` 禁用，只在用户点击的 `tabId` 上显式启用。action handler 必须在事件回合内直接派发 `setOptions()` 与 `sidePanel.open()`；不得先等待异步预检。新面板自行发送候选 EstablishSession；已经打开的面板由 action handler 的无凭证通知触发重试。通知指向另一标签页时必须重建会话；指向同一标签页且已有句柄时，先用不读取页面正文的最小会话校验确认 documentId，校验通过则保留现有 resource capability，失效才重建。两条路径都**不把面板加载或通知当成点击证明**：只有 §8.3 的最小授权探针成功后才签发会话。
+- panel capability 全局保持唯一：新标签点击成功后禁用其余标签的 panel；同 origin 导航保留，跨 origin 导航禁用该标签的 panel。该原生可见性绑定与 ScanSession 安全生命周期相互独立，标签切换仍立即吊销旧 ScanSession。
 - SPK-1 已冻结该授权入口；SPK-3～4 继续验证导航、标签/窗口切换和面板关闭/刷新生命周期。
 
 ## 9. Service Worker 生命周期与恢复
@@ -1207,8 +1219,8 @@ Fixture 只保存完成测试所需的最小片段，不把第三方插件包当
 
 基础与授权：
 
-1. 扩展以解压方式安装并在 Chrome 116+ 正常启动；初始化时关闭 `openPanelOnActionClick`，并由显式 `action.onClicked → sidePanel.open()` 打开面板。
-2. 点击图标可打开 Side Panel，并扫描当前公开 Shopify 店铺。
+1. 扩展以解压方式安装并在 Chrome 116+ 正常启动；初始化时关闭 `openPanelOnActionClick` 与全局 panel，并由显式 `action.onClicked → setOptions({tabId}) + open({tabId})` 打开面板。
+2. 点击图标可打开 Side Panel 并扫描当前公开 Shopify 店铺；切到其他标签时面板隐藏，切回原标签时恢复，在另一标签点击后唯一绑定迁移到新标签。
 3. 未经点击授权不会注入内容采集器，也不会发起扫描请求。
 4. MAIN/ISOLATED 边界测试通过：Collector 读不到页面 JS 变量，Probe 只返回白名单字段且经 Schema 校验。
 5. 只有最小授权探针成功后才签发 ScanSession；activeTab 未授权或已失效、面板直接加载/刷新时，扫描按钮禁用并提示重新点击图标，面板"扫描"按钮从不自行取得新授权。
