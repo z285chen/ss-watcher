@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "SS Watcher",
-  "version": "0.2.0",
-  "description": "Local-only Shopify storefront catalog analysis and safe export tool.",
+  "version": "0.3.0",
+  "description": "Local-only Shopify storefront catalog and frontend intelligence tool.",
   "minimum_chrome_version": "116",
   "permissions": ["activeTab", "scripting", "storage", "sidePanel"],
   "optional_host_permissions": [],

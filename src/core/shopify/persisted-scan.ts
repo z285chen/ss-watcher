@@ -17,6 +17,10 @@ import {
   type StorefrontScanResult,
   type StorefrontScanStage,
 } from "./storefront-scanner";
+import {
+  emptyFrontendIntelligence,
+  type FrontendIntelligenceResult,
+} from "../frontend/frontend-intelligence";
 
 const STALE_RUN_AFTER_MS = 60_000;
 
@@ -30,6 +34,7 @@ export type PersistedScanInput = Omit<
     store: StagingStore;
     onProducts?: StorefrontScanInput["onProducts"];
     onStage?: (stage: PersistedScanStage) => void;
+    frontend?: FrontendIntelligenceResult | Promise<FrontendIntelligenceResult>;
   }>;
 
 export type PersistedScanResult = Readonly<{
@@ -40,7 +45,7 @@ export type PersistedScanResult = Readonly<{
   committed: CommittedSnapshotBundle;
 }>;
 
-/** Persists one M1+M2 scan through the proven staging -> commit boundary. */
+/** Persists the M1–M3 scan through the proven staging -> commit boundary. */
 export async function runPersistedStorefrontScan(
   input: PersistedScanInput,
 ): Promise<PersistedScanResult> {
@@ -61,6 +66,7 @@ export async function runPersistedStorefrontScan(
         "statistics",
         "rankings",
         "newness",
+        ...(input.frontend === undefined ? [] : ["frontend-intelligence"]),
       ],
     });
     started = true;
@@ -189,6 +195,20 @@ export async function runPersistedStorefrontScan(
       status: newnessModuleStatus(analysis),
       result: analysis.newness,
     });
+    const frontend =
+      input.frontend === undefined
+        ? undefined
+        : await Promise.resolve(input.frontend).catch((error: unknown) =>
+            emptyFrontendIntelligence([], errorMessage(error)),
+          );
+    if (frontend !== undefined) {
+      await input.store.writeModuleResult(scanRunId, {
+        moduleId: "frontend-intelligence",
+        status: frontendModuleStatus(frontend),
+        result: frontend,
+        ...(frontend.errors.length === 0 ? {} : { errors: frontend.errors }),
+      });
+    }
     const rankingRows = analysis.bestSelling.items.map((item) => ({
       ...item,
       scope: analysis.bestSelling.scope,
@@ -198,6 +218,7 @@ export async function runPersistedStorefrontScan(
       ...scan.catalog.errors,
       ...analysis.bestSelling.errors,
       ...analysis.createdDescending.errors,
+      ...(frontend?.errors.map((error) => `frontend: ${error}`) ?? []),
     ];
     await input.store.writeSnapshotDraft(scanRunId, {
       storeKey: input.origin,
@@ -244,7 +265,16 @@ export async function runPersistedStorefrontScan(
           }),
       rankings: rankingRows,
       newness: analysis.newness.candidates,
-      apps: [],
+      ...(frontend === undefined
+        ? { apps: [] }
+        : {
+            frontend,
+            resources: frontend.resources,
+            apps: frontend.findings.filter(
+              (finding) =>
+                finding.category === "app" || finding.category === "pixel",
+            ),
+          }),
       socials: input.collector.ok ? input.collector.socials : [],
       errors: analysisErrors,
     });
@@ -261,6 +291,23 @@ export async function runPersistedStorefrontScan(
     }
     throw error;
   }
+}
+
+function frontendModuleStatus(
+  frontend: FrontendIntelligenceResult,
+): ModuleTerminalStatus {
+  switch (frontend.status) {
+    case "completed":
+      return "completed";
+    case "partial":
+      return "partial";
+    case "failed":
+      return "failed";
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return (error instanceof Error ? error.message : String(error)).slice(0, 256);
 }
 
 function rankingModuleStatus(

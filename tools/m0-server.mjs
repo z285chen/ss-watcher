@@ -226,6 +226,57 @@ async function route(request, response, role) {
     return;
   }
 
+  if (url.pathname === "/assets/m3-theme.js") {
+    send(
+      response,
+      200,
+      "text/javascript; charset=utf-8",
+      [
+        "window.Shopify = window.Shopify || {};",
+        "Shopify.theme = { name: 'M3 Fixture' };",
+        "const publicEndpoint = '/cart.js';",
+        "gtag('config', 'G-FIXTURE');",
+        "//# sourceMappingURL=m3-theme.js.map?v=1",
+      ].join("\n"),
+    );
+    return;
+  }
+  if (url.pathname === "/assets/m3-theme.css") {
+    send(
+      response,
+      200,
+      "text/css; charset=utf-8",
+      ".m3-fixture { display: grid; }\n/*# sourceMappingURL=m3-theme.css.map?v=1 */",
+    );
+    return;
+  }
+  if (
+    url.pathname === "/assets/m3-theme.js.map" ||
+    url.pathname === "/assets/m3-theme.css.map"
+  ) {
+    sendJson(response, 200, {
+      version: 3,
+      sources: ["src/m3-fixture.ts"],
+      names: ["publicEndpoint"],
+      mappings: "AAAA",
+      sourcesContent: ["const rawFixtureSource = true;"],
+    });
+    return;
+  }
+  if (url.pathname === "/assets/m3-wrong-mime.js") {
+    send(response, 200, "image/png", "not-a-script");
+    return;
+  }
+  if (url.pathname === "/assets/m3-large.js") {
+    send(
+      response,
+      200,
+      "text/javascript; charset=utf-8",
+      "x".repeat(2 * 1_024 * 1_024 + 1),
+    );
+    return;
+  }
+
   if (url.pathname === "/meta.json") {
     sendJson(response, 200, {
       name: "M0 Hosted Fixture",
@@ -380,7 +431,9 @@ function hostedPage(routeRoot) {
   <head>
     <meta name="generator" content="Shopify">
     <link rel="canonical" href="${mainOrigin}${routeRoot}">
-    <link rel="stylesheet" href="https://cdn.shopify.com/s/files/1/0000/t/1/assets/theme.css">
+    <link rel="stylesheet" href="${mainOrigin}/assets/m3-theme.css?v=1">
+    <link rel="preconnect" href="https://cdn.shopify.com">
+    <script defer src="${mainOrigin}/assets/m3-theme.js?v=1"></script>
     <script>
       window.Shopify = {
         shop: "m0-fixture.myshopify.com",

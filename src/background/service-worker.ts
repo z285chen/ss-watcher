@@ -28,10 +28,21 @@ import type {
   SessionSummary,
 } from "../shared/messages";
 import { InFlightRequestRegistry } from "./in-flight-requests";
+import {
+  deriveSourceMapCapability,
+  executeRegisteredResourceRequest,
+  registerResourceCandidates,
+} from "../core/frontend/resource-policy";
+import type {
+  CollectorResourceCandidate,
+  ResourceFetchResult,
+} from "../core/frontend/resource-types";
+import { ResourceScanBudgetRegistry } from "./resource-scan-budget";
 
 const bootId = crypto.randomUUID();
 const sessionManager = new SessionManager(createSessionApi());
 const inFlightRequests = new InFlightRequestRegistry();
+const resourceBudgets = new ResourceScanBudgetRegistry();
 
 void configureExtension();
 
@@ -66,32 +77,38 @@ chrome.runtime.onStartup.addListener(() => {
 
 chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
   inFlightRequests.cancelInactiveForWindow(windowId, tabId);
+  resourceBudgets.cancelInactiveForWindow(windowId, tabId);
   void sessionManager.revokeInactiveForWindow(windowId, tabId);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.url !== undefined || changeInfo.status === "loading") {
     inFlightRequests.cancelTab(tabId);
+    resourceBudgets.cancelTab(tabId);
     void sessionManager.revokeByTab(tabId);
   }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   inFlightRequests.cancelTab(tabId);
+  resourceBudgets.cancelTab(tabId);
   void sessionManager.revokeByTab(tabId);
 });
 
 chrome.windows.onRemoved.addListener((windowId) => {
   inFlightRequests.cancelWindow(windowId);
+  resourceBudgets.cancelWindow(windowId);
   void sessionManager.revokeByWindow(windowId);
 });
 
 chrome.windows.onFocusChanged.addListener((windowId) => {
   if (windowId === chrome.windows.WINDOW_ID_NONE) {
     inFlightRequests.cancelAll();
+    resourceBudgets.clear();
     void sessionManager.revokeAll();
   } else {
     inFlightRequests.cancelOutsideWindow(windowId);
+    resourceBudgets.cancelOutsideWindow(windowId);
     void sessionManager.revokeOutsideWindow(windowId);
   }
 });
@@ -200,6 +217,7 @@ async function handleMessage(
 
   if (message.type === "M0_REVOKE_SESSION") {
     inFlightRequests.cancelRun(handle.runId);
+    resourceBudgets.cancelRun(handle.runId);
     const revoked = await sessionManager.revoke(handle.runId);
     return revoked
       ? { ok: true, bootId, revoked: true }
@@ -210,10 +228,32 @@ async function handleMessage(
     if (!isValidScanId(message.scanId)) {
       return fail("invalid_request", "scanId 格式无效");
     }
+    resourceBudgets.finish(handle.runId, message.scanId);
+    const cancelled = inFlightRequests.cancel(handle.runId, message.scanId);
+    // A cancelled scan/export must not leave page-observed or SW-derived URL
+    // capabilities usable against an older committed snapshot. This mutation
+    // is serialized with late source-map registration, so cleanup wins both
+    // sides of the cancellation race while the non-resource session remains.
+    const cleared = await sessionManager.replaceRegisteredResources(handle, []);
+    if (!cleared.ok) {
+      return fail(cleared.reason, sessionFailureMessage(cleared.reason));
+    }
     return {
       ok: true,
       bootId,
-      cancelled: inFlightRequests.cancel(handle.runId, message.scanId),
+      cancelled,
+      capabilitiesCleared: true,
+    };
+  }
+
+  if (message.type === "M3_FINISH_RESOURCE_SCAN") {
+    if (!isValidScanId(message.scanId)) {
+      return fail("invalid_request", "scanId 格式无效");
+    }
+    return {
+      ok: true,
+      bootId,
+      finished: resourceBudgets.finish(handle.runId, message.scanId),
     };
   }
 
@@ -226,64 +266,220 @@ async function handleMessage(
   }
   const { session } = executionValidation;
 
-  if (message.type === "M0_RUN_PROBES") {
-    const [mainAttempt, collectorAttempt] = await Promise.allSettled([
-      chrome.scripting.executeScript<[], ShopifyProbeResult | null>({
-        target: { tabId: session.tabId, frameIds: [0] },
-        world: "MAIN",
-        func: mainWorldShopifyProbe,
-      }),
-      chrome.scripting.executeScript<
-        [{ expectedOrigin: string; expectedPathname: string }],
-        CollectorProbeResult
-      >({
-        target: { tabId: session.tabId, frameIds: [0] },
-        world: "ISOLATED",
-        func: collectorProbe,
-        args: [
-          {
-            expectedOrigin: session.origin,
-            expectedPathname: session.pathname,
-          },
-        ],
-      }),
-    ]);
-
-    if (collectorAttempt.status === "rejected") {
-      await sessionManager.revoke(session.runId);
-      return fail("authorization_probe_failed", "ISOLATED Collector 注入失败");
-    }
-    const collector = readInjectionResult(
-      collectorAttempt.value,
-      session.documentId,
-    );
-    if (collector === undefined || !isCollectorProbeResult(collector)) {
-      await sessionManager.revoke(session.runId);
-      return fail("authorization_race", "Collector 返回通道或页面文档已发生变化");
-    }
-
-    // MAIN is page-owned and therefore best-effort. A hostile getter, page
-    // CSP/environment issue, or an invalid payload degrades to null while the
-    // independently validated Collector and endpoint flow remain usable.
-    let main: ShopifyProbeResult | null = null;
-    if (mainAttempt.status === "fulfilled") {
-      const candidate = readInjectionResult(mainAttempt.value, session.documentId);
-      if (candidate !== undefined && isShopifyProbeResult(candidate)) {
-        main = candidate;
-      }
-    }
-
-    const afterProbe = await sessionManager.validateForExecution(handle);
-    if (!afterProbe.ok) {
-      return fail(afterProbe.reason, sessionFailureMessage(afterProbe.reason));
-    }
+  if (message.type === "M0_VALIDATE_SESSION") {
     return {
       ok: true,
       bootId,
       session: sessionSummary(session),
-      main,
-      collector,
     };
+  }
+
+  if (message.type === "M0_RUN_PROBES") {
+    if (message.scanId !== undefined && !isValidScanId(message.scanId)) {
+      return fail("invalid_request", "scanId 格式无效");
+    }
+    const probeLease =
+      message.scanId === undefined
+        ? undefined
+        : inFlightRequests.acquire({
+            runId: handle.runId,
+            scanId: message.scanId,
+            tabId: session.tabId,
+            windowId: session.windowId,
+          });
+    try {
+      const [mainAttempt, collectorAttempt] = await Promise.allSettled([
+        chrome.scripting.executeScript<[], ShopifyProbeResult | null>({
+          target: { tabId: session.tabId, frameIds: [0] },
+          world: "MAIN",
+          func: mainWorldShopifyProbe,
+        }),
+        chrome.scripting.executeScript<
+          [{ expectedOrigin: string; expectedPathname: string }],
+          CollectorProbeResult
+        >({
+          target: { tabId: session.tabId, frameIds: [0] },
+          world: "ISOLATED",
+          func: collectorProbe,
+          args: [
+            {
+              expectedOrigin: session.origin,
+              expectedPathname: session.pathname,
+            },
+          ],
+        }),
+      ]);
+
+      if (probeLease?.signal.aborted) {
+        return fail("scan_cancelled", "扫描已取消");
+      }
+
+      if (collectorAttempt.status === "rejected") {
+        await sessionManager.revoke(session.runId);
+        return fail("authorization_probe_failed", "ISOLATED Collector 注入失败");
+      }
+      const collector = readInjectionResult(
+        collectorAttempt.value,
+        session.documentId,
+      );
+      if (collector === undefined || !isCollectorProbeResult(collector)) {
+        await sessionManager.revoke(session.runId);
+        return fail("authorization_race", "Collector 返回通道或页面文档已发生变化");
+      }
+
+      // MAIN is page-owned and therefore best-effort. A hostile getter, page
+      // CSP/environment issue, or an invalid payload degrades to null while the
+      // independently validated Collector and endpoint flow remain usable.
+      let main: ShopifyProbeResult | null = null;
+      if (mainAttempt.status === "fulfilled") {
+        const candidate = readInjectionResult(mainAttempt.value, session.documentId);
+        if (candidate !== undefined && isShopifyProbeResult(candidate)) {
+          main = candidate;
+        }
+      }
+
+      const afterProbe = await sessionManager.validateForExecution(handle);
+      if (!afterProbe.ok) {
+        return fail(afterProbe.reason, sessionFailureMessage(afterProbe.reason));
+      }
+      if (probeLease?.signal.aborted) {
+        return fail("scan_cancelled", "扫描已取消");
+      }
+      const resources = registerResourceCandidates(
+        collector.ok ? (collector.resources ?? []) : [],
+        { origin: afterProbe.session.origin },
+      );
+      const registered = await sessionManager.replaceRegisteredResources(
+        handle,
+        resources,
+      );
+      if (!registered.ok) {
+        return fail(registered.reason, sessionFailureMessage(registered.reason));
+      }
+      const afterRegistration = await sessionManager.validateForExecution(handle);
+      if (!afterRegistration.ok) {
+        return fail(
+          afterRegistration.reason,
+          sessionFailureMessage(afterRegistration.reason),
+        );
+      }
+      if (probeLease?.signal.aborted) {
+        return fail("scan_cancelled", "扫描已取消");
+      }
+      return {
+        ok: true,
+        bootId,
+        session: sessionSummary(afterRegistration.session),
+        main,
+        collector,
+        resources,
+      };
+    } finally {
+      probeLease?.release();
+    }
+  }
+
+  if (message.type === "M3_FETCH_RESOURCE") {
+    if (!isValidResourceId(message.resourceId)) {
+      return fail("invalid_request", "resourceId 格式无效");
+    }
+    if (!isValidScanId(message.scanId)) {
+      return fail("invalid_request", "scanId 格式无效");
+    }
+    const descriptor = session.resources?.find(
+      (resource) => resource.resourceId === message.resourceId,
+    );
+    if (descriptor === undefined) {
+      const result: ResourceFetchResult = {
+        ok: false,
+        resourceId: message.resourceId,
+        reason: "resource_not_registered",
+      };
+      return { ok: true, bootId, result };
+    }
+    const scope = {
+      runId: handle.runId,
+      scanId: message.scanId,
+      tabId: session.tabId,
+      windowId: session.windowId,
+    };
+    const budgetLease = resourceBudgets.acquire(scope, descriptor.kind);
+    if (budgetLease === undefined) {
+      const result: ResourceFetchResult = {
+        ok: false,
+        resourceId: descriptor.resourceId,
+        reason: "budget_exceeded",
+        descriptor: {
+          ...descriptor,
+          fetchStatus: "skipped",
+          failureReason: "budget_exceeded",
+        },
+      };
+      return { ok: true, bootId, result };
+    }
+    const lease = inFlightRequests.acquire(scope);
+    let result: ResourceFetchResult;
+    let acceptedBytes: number | undefined;
+    try {
+      result = await executeRegisteredResourceRequest(
+        { origin: session.origin },
+        descriptor,
+        {
+          signal: lease.signal,
+          maximumBytes: budgetLease.maximumBytes,
+        },
+      );
+      if (result.ok) acceptedBytes = result.descriptor.byteLength ?? 0;
+      else if (result.reason === "too_large" && budgetLease.budgetLimited) {
+        result = {
+          ...result,
+          reason: "budget_exceeded",
+          ...(result.descriptor === undefined
+            ? {}
+            : {
+                descriptor: {
+                  ...result.descriptor,
+                  fetchStatus: "skipped",
+                  failureReason: "budget_exceeded",
+                },
+              }),
+        };
+      }
+    } finally {
+      budgetLease.complete(acceptedBytes);
+      lease.release();
+    }
+    const afterFetch = await sessionManager.validateForExecution(handle);
+    if (!afterFetch.ok) {
+      return fail(afterFetch.reason, sessionFailureMessage(afterFetch.reason));
+    }
+    if (result.ok) {
+      const derived = deriveSourceMapCapability(
+        { origin: afterFetch.session.origin },
+        result.descriptor,
+        result.text,
+      );
+      if (derived !== undefined) {
+        const registration = await sessionManager.registerDerivedResource(
+          handle,
+          descriptor.resourceId,
+          derived,
+        );
+        if (!registration.ok && registration.reason !== "resource_limit") {
+          return fail(
+            registration.reason,
+            sessionFailureMessage(registration.reason),
+          );
+        }
+        if (registration.ok) {
+          result = {
+            ...result,
+            derivedResources: [registration.resource],
+          };
+        }
+      }
+    }
+    return { ok: true, bootId, result };
   }
 
   if (!isEndpointRequest(message.endpoint)) {
@@ -428,8 +624,11 @@ function isM0Message(value: unknown): value is M0Request {
   if (!isRecord(value) || typeof value.type !== "string") return false;
   return [
     "M0_ESTABLISH_SESSION",
+    "M0_VALIDATE_SESSION",
     "M0_RUN_PROBES",
     "M0_FETCH_ENDPOINT",
+    "M3_FETCH_RESOURCE",
+    "M3_FINISH_RESOURCE_SCAN",
     "M1_CANCEL_SCAN",
     "M0_REVOKE_SESSION",
     "M0_GET_BOOT_ID",
@@ -440,6 +639,15 @@ function isValidScanId(value: unknown): value is string {
   return (
     typeof value === "string" &&
     /^[a-zA-Z0-9._~-]{1,128}$/u.test(value)
+  );
+}
+
+function isValidResourceId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+      value,
+    )
   );
 }
 
@@ -537,7 +745,78 @@ function isCollectorProbeResult(value: unknown): value is CollectorProbeResult {
     ) &&
     Array.isArray(value.socials) &&
     value.socials.length <= 12 &&
-    value.socials.every(isCollectorSocialLink)
+    value.socials.every(isCollectorSocialLink) &&
+    (value.resources === undefined ||
+      (Array.isArray(value.resources) &&
+        value.resources.length <= 300 &&
+        value.resources.every(isCollectorResourceCandidate) &&
+        collectorResourceBytes(value.resources) <= 192 * 1_024))
+  );
+}
+
+function isCollectorResourceCandidate(
+  value: unknown,
+): value is CollectorResourceCandidate {
+  if (!isRecord(value)) return false;
+  const allowedKinds = new Set([
+    "document",
+    "script",
+    "style",
+    "json",
+    "source-map",
+    "iframe",
+    "image",
+    "font",
+    "other",
+  ]);
+  if (
+    typeof value.url !== "string" ||
+    value.url.length === 0 ||
+    value.url.length > 2_048 ||
+    !allowedKinds.has(String(value.kind)) ||
+    !["none", "cache-key", "redacted"].includes(String(value.queryPolicy)) ||
+    !Array.isArray(value.sources) ||
+    value.sources.length < 1 ||
+    value.sources.length > 2 ||
+    !value.sources.every(
+      (source) => source === "dom" || source === "resource-timing",
+    ) ||
+    (value.initiator !== undefined &&
+      (typeof value.initiator !== "string" || value.initiator.length > 64)) ||
+    !isOptionalMetric(value.transferSize) ||
+    !isOptionalMetric(value.durationMs)
+  ) {
+    return false;
+  }
+  try {
+    const url = new URL(value.url);
+    return (
+      (url.protocol === "http:" || url.protocol === "https:") &&
+      url.username.length === 0 &&
+      url.password.length === 0 &&
+      url.hash.length === 0 &&
+      (value.queryPolicy === "cache-key" || url.search.length === 0)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function collectorResourceBytes(values: readonly unknown[]): number {
+  let bytes = 0;
+  for (const value of values) {
+    if (!isRecord(value) || typeof value.url !== "string") {
+      return Number.POSITIVE_INFINITY;
+    }
+    bytes += new TextEncoder().encode(value.url).byteLength;
+  }
+  return bytes;
+}
+
+function isOptionalMetric(value: unknown): boolean {
+  return (
+    value === undefined ||
+    (typeof value === "number" && Number.isFinite(value) && value >= 0)
   );
 }
 

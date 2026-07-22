@@ -139,6 +139,26 @@ describe("collectorProbe", () => {
       ],
       collectionHandles: [],
       socials: [],
+      resources: [
+        {
+          url: "https://store.example/Products//Widget",
+          kind: "document",
+          queryPolicy: "redacted",
+          sources: ["dom"],
+        },
+        {
+          url: "https://cdn.shopify.com/theme.js?v=private",
+          kind: "script",
+          queryPolicy: "cache-key",
+          sources: ["dom"],
+        },
+        {
+          url: "https://cdn.shopify.com/s/files/1/0000/t/1/assets/theme.css?v=secret",
+          kind: "style",
+          queryPolicy: "cache-key",
+          sources: ["dom"],
+        },
+      ],
     });
   });
 
@@ -252,6 +272,26 @@ describe("collectorProbe", () => {
             { href: "https://www.facebook.com/sharer/sharer.php?u=private" },
           ];
         }
+        if (selector === 'script[type="application/ld+json"]') {
+          return [
+            {
+              textContent: JSON.stringify({
+                "@type": "Organization",
+                sameAs: [
+                  "https://x.com/jsonld-should-not-replace-dom",
+                  "https://pinterest.com/store/?utm_source=jsonld",
+                  { "@id": "https://linkedin.com/company/store/#about" },
+                ],
+              }),
+            },
+            {
+              textContent: JSON.stringify({
+                "@type": "Product",
+                sameAs: "https://facebook.com/not-the-store",
+              }),
+            },
+          ];
+        }
         return [];
       },
     });
@@ -268,11 +308,76 @@ describe("collectorProbe", () => {
         { platform: "instagram", url: "https://instagram.com/store/" },
         { platform: "x", url: "https://x.com/store" },
         { platform: "youtube", url: "https://www.youtube.com/@store" },
+        { platform: "pinterest", url: "https://pinterest.com/store/" },
+        { platform: "linkedin", url: "https://linkedin.com/company/store/" },
       ],
     });
     expect(JSON.stringify(result)).not.toContain("intent");
     expect(JSON.stringify(result)).not.toContain("watch");
     expect(JSON.stringify(result)).not.toContain("sharer");
+    expect(JSON.stringify(result)).not.toContain("not-the-store");
+    expect(JSON.stringify(result)).not.toContain("jsonld-should-not-replace-dom");
+  });
+
+  it("merges DOM and Resource Timing coverage while redacting unsafe query values", () => {
+    vi.stubGlobal("location", {
+      origin: "https://store.example",
+      pathname: "/",
+      href: "https://store.example/",
+    });
+    vi.stubGlobal("document", {
+      querySelector: () => undefined,
+      scripts: [{ src: "https://store.example/assets/theme.js?v=1" }],
+      querySelectorAll: () => [],
+    });
+    vi.stubGlobal("performance", {
+      getEntriesByType: (type: string) =>
+        type === "resource"
+          ? [
+              {
+                name: "https://store.example/assets/theme.js?v=1#ignored",
+                initiatorType: "script",
+                transferSize: 4_096,
+                duration: 42.5,
+              },
+              {
+                name: "https://store.example/api/public.json?token=secret",
+                initiatorType: "fetch",
+                transferSize: 512,
+                duration: 8,
+              },
+            ]
+          : [],
+    });
+
+    const result = collectorProbe({
+      expectedOrigin: "https://store.example",
+      expectedPathname: "/",
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      resources: expect.arrayContaining([
+        {
+          url: "https://store.example/assets/theme.js?v=1",
+          kind: "script",
+          queryPolicy: "cache-key",
+          sources: ["dom", "resource-timing"],
+          initiator: "script",
+          transferSize: 4_096,
+          durationMs: 42.5,
+        },
+        {
+          url: "https://store.example/api/public.json",
+          kind: "json",
+          queryPolicy: "redacted",
+          sources: ["resource-timing"],
+          initiator: "fetch",
+          transferSize: 512,
+          durationMs: 8,
+        },
+      ]),
+    });
+    expect(JSON.stringify(result)).not.toContain("token=secret");
   });
 
   it("rejects locale-prefixed sensitive and ambiguous paths before DOM access", () => {

@@ -15,6 +15,8 @@ export type ExportMeta = Readonly<{
   generatedAt: string;
   fieldsSanitized: boolean;
   csvFormulaDefense: "apostrophe-prefix" | "none";
+  rawSourceIncluded: false;
+  removedRawSourceFieldCount: number;
 }>;
 
 export type JsonSnapshotExport = Readonly<{
@@ -60,11 +62,29 @@ export function createFullJsonExport(
   bundle: CommittedSnapshotBundle,
   generatedAt = new Date().toISOString(),
 ): { value: JsonSnapshotExport; json: string } {
+  const snapshot = structuredClone(bundle.snapshot);
+  const moduleResults = structuredClone(bundle.moduleResults);
+  const removedRawSourceFieldCount =
+    stripRawSourceFields(snapshotFrontend(snapshot)) +
+    moduleResults.reduce(
+      (count, moduleResult) =>
+        moduleResult.moduleId === "frontend-intelligence"
+          ? count + stripRawSourceFields(moduleResult.result)
+          : count,
+      0,
+    );
   const value: JsonSnapshotExport = {
-    meta: exportMeta(bundle, bundle.products.length, generatedAt, false, false),
-    snapshot: structuredClone(bundle.snapshot),
+    meta: exportMeta(
+      bundle,
+      bundle.products.length,
+      generatedAt,
+      removedRawSourceFieldCount > 0,
+      false,
+      removedRawSourceFieldCount,
+    ),
+    snapshot,
     products: structuredClone(bundle.products),
-    moduleResults: structuredClone(bundle.moduleResults),
+    moduleResults,
   };
   return { value, json: JSON.stringify(value, null, 2) };
 }
@@ -99,6 +119,7 @@ export function createProductCsvExport(
     generatedAt,
     sanitizedCellCount > 0,
     formulaDefense,
+    0,
   );
   return {
     csv: `${rows.join("\r\n")}\r\n`,
@@ -137,6 +158,7 @@ function exportMeta(
   generatedAt: string,
   fieldsSanitized: boolean,
   formulaDefense: boolean,
+  removedRawSourceFieldCount: number,
 ): ExportMeta {
   const coverage = bundle.snapshot.coverage;
   return {
@@ -153,7 +175,45 @@ function exportMeta(
     generatedAt: validIsoTimestamp(generatedAt),
     fieldsSanitized,
     csvFormulaDefense: formulaDefense ? "apostrophe-prefix" : "none",
+    rawSourceIncluded: false,
+    removedRawSourceFieldCount,
   };
+}
+
+const RAW_SOURCE_FIELD_NAMES = new Set([
+  "body",
+  "rawsource",
+  "rawtext",
+  "sourcecontent",
+  "sourcecode",
+  "sourcetext",
+  "sourcescontent",
+  "text",
+]);
+
+function snapshotFrontend(snapshot: unknown): unknown {
+  return isRecord(snapshot) ? snapshot.frontend : undefined;
+}
+
+/** Defense in depth: standard snapshot export must never become a source dump. */
+function stripRawSourceFields(value: unknown): number {
+  if (Array.isArray(value)) {
+    return value.reduce(
+      (count, item) => count + stripRawSourceFields(item),
+      0,
+    );
+  }
+  if (!isRecord(value)) return 0;
+  let removed = 0;
+  for (const key of Object.keys(value)) {
+    if (RAW_SOURCE_FIELD_NAMES.has(key.toLowerCase())) {
+      delete value[key];
+      removed += 1;
+      continue;
+    }
+    removed += stripRawSourceFields(value[key]);
+  }
+  return removed;
 }
 
 function productCsvRow(record: ProductRecord): Record<(typeof CSV_COLUMNS)[number], string> {

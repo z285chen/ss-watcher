@@ -6,6 +6,10 @@ import type {
   CollectorProbeResult,
   ShopifyProbeResult,
 } from "../content/probes";
+import type {
+  ResourceDescriptor,
+  ResourceFetchResult,
+} from "../core/frontend/resource-types";
 
 export type SessionHandle = {
   runId: string;
@@ -40,6 +44,13 @@ export type M0Request =
       type: "M0_RUN_PROBES";
       handle: SessionHandle;
       panelInstanceId: string;
+      /** Present for a cancellable scan; omitted by the standalone probe action. */
+      scanId?: string;
+    }
+  | {
+      type: "M0_VALIDATE_SESSION";
+      handle: SessionHandle;
+      panelInstanceId: string;
     }
   | {
       type: "M0_FETCH_ENDPOINT";
@@ -48,6 +59,19 @@ export type M0Request =
       endpoint: EndpointRequest;
       routeRoot?: string;
       scanId?: string;
+    }
+  | {
+      type: "M3_FETCH_RESOURCE";
+      handle: SessionHandle;
+      panelInstanceId: string;
+      resourceId: string;
+      scanId: string;
+    }
+  | {
+      type: "M3_FINISH_RESOURCE_SCAN";
+      handle: SessionHandle;
+      panelInstanceId: string;
+      scanId: string;
     }
   | {
       type: "M1_CANCEL_SCAN";
@@ -85,6 +109,15 @@ export type ProbeResponse =
       session: SessionSummary;
       main: ShopifyProbeResult | null;
       collector: CollectorProbeResult;
+      resources: ResourceDescriptor[];
+    }
+  | M0ErrorResponse;
+
+export type ValidateSessionResponse =
+  | {
+      ok: true;
+      bootId: string;
+      session: SessionSummary;
     }
   | M0ErrorResponse;
 
@@ -96,20 +129,40 @@ export type EndpointResponse =
     }
   | M0ErrorResponse;
 
+export type ResourceResponse =
+  | {
+      ok: true;
+      bootId: string;
+      result: ResourceFetchResult;
+    }
+  | M0ErrorResponse;
+
 export type RevokeResponse =
   | { ok: true; bootId: string; revoked: true }
   | M0ErrorResponse;
 
 export type CancelScanResponse =
-  | { ok: true; bootId: string; cancelled: boolean }
+  | {
+      ok: true;
+      bootId: string;
+      cancelled: boolean;
+      capabilitiesCleared: true;
+    }
+  | M0ErrorResponse;
+
+export type FinishResourceScanResponse =
+  | { ok: true; bootId: string; finished: boolean }
   | M0ErrorResponse;
 
 export type BootResponse = { ok: true; bootId: string } | M0ErrorResponse;
 
 export type M0Response =
   | EstablishSessionResponse
+  | ValidateSessionResponse
   | ProbeResponse
   | EndpointResponse
+  | ResourceResponse
   | CancelScanResponse
+  | FinishResourceScanResponse
   | RevokeResponse
   | BootResponse;

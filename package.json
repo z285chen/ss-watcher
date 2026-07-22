@@ -1,6 +1,6 @@
 {
   "name": "ss-watcher",
-  "version": "0.2.0-m2",
+  "version": "0.3.0-m3",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,12 +9,15 @@
     "m0:server": "node tools/m0-server.mjs",
     "m1:server": "node tools/m0-server.mjs",
     "m2:server": "node tools/m0-server.mjs",
+    "m3:server": "node tools/m0-server.mjs",
     "test": "vitest run",
     "test:m0-network": "vitest run tests/integration/request-policy-server.test.ts --reporter=verbose",
     "test:m0-shopify-live": "vitest run tests/integration/shopify-live.test.ts --reporter=verbose",
     "test:m1-network": "vitest run tests/integration/request-policy-server.test.ts --reporter=verbose",
     "test:m1-shopify-live": "vitest run tests/integration/shopify-live.test.ts --reporter=verbose",
     "test:m2-network": "vitest run tests/integration/request-policy-server.test.ts --reporter=verbose",
+    "test:m3-network": "vitest run tests/integration/request-policy-server.test.ts --reporter=verbose",
+    "test:m3-fingerprints": "vitest run tests/unit/fingerprint-engine.test.ts --reporter=verbose",
     "test:m2-shopify-live": "vitest run tests/integration/shopify-live.test.ts --reporter=verbose",
     "test:watch": "vitest"
   },

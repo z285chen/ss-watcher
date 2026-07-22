@@ -10,6 +10,7 @@ import type {
   EndpointRequest,
 } from "../../src/core/network/request-policy";
 import type { EndpointExecutor } from "../../src/core/shopify/catalog-scanner";
+import type { FrontendIntelligenceResult } from "../../src/core/frontend/frontend-intelligence";
 
 const stores: StagingStore[] = [];
 const origin = "https://store.example";
@@ -92,6 +93,7 @@ describe("persisted M1+M2 storefront scan", () => {
         ],
       }),
       execute,
+      frontend: frontendFixture(),
     });
 
     expect(result.scan).toMatchObject({
@@ -134,6 +136,17 @@ describe("persisted M1+M2 storefront scan", () => {
         expect.objectContaining({ rank: 2, handle: "product-2" }),
       ],
       newness: expect.any(Array),
+      frontend: expect.objectContaining({
+        status: "completed",
+        analyzerVersion: "token-url-v2",
+        fingerprintRulesVersion: "public-signals-v1.0.0",
+      }),
+      resources: [
+        expect.objectContaining({
+          resourceId: "00000000-0000-4000-8000-000000000001",
+          sha256: "a".repeat(64),
+        }),
+      ],
     });
     expect(result.committed.products).toHaveLength(2);
     expect(result.committed.moduleResults).toEqual(
@@ -152,6 +165,10 @@ describe("persisted M1+M2 storefront scan", () => {
         expect.objectContaining({ moduleId: "statistics", status: "completed" }),
         expect.objectContaining({ moduleId: "rankings", status: "completed" }),
         expect.objectContaining({ moduleId: "newness", status: "partial" }),
+        expect.objectContaining({
+          moduleId: "frontend-intelligence",
+          status: "completed",
+        }),
       ]),
     );
     await expect(store.getRun(result.scanRunId)).resolves.toMatchObject({
@@ -179,6 +196,7 @@ describe("persisted M1+M2 storefront scan", () => {
         socials: [
           { platform: "instagram", url: "https://instagram.com/fixture" },
         ],
+        resources: [expect.objectContaining({ fetchStatus: "analyzed" })],
       },
       products: [{ snapshotId: result.snapshotId }, { snapshotId: result.snapshotId }],
     });
@@ -402,6 +420,43 @@ function collector(
     collectionHandles: [],
     socials: [],
     ...overrides,
+  };
+}
+
+function frontendFixture(): FrontendIntelligenceResult {
+  const resource = {
+    resourceId: "00000000-0000-4000-8000-000000000001",
+    url: "https://store.example/assets/theme.js",
+    originRelation: "same-origin" as const,
+    kind: "script" as const,
+    queryPolicy: "none" as const,
+    sources: ["dom" as const],
+    fetchStatus: "analyzed" as const,
+    contentType: "text/javascript",
+    byteLength: 18,
+    sha256: "a".repeat(64),
+  };
+  return {
+    status: "completed",
+    analyzerVersion: "token-url-v2",
+    fingerprintRulesVersion: "public-signals-v1.0.0",
+    summary: {
+      totalResources: 1,
+      sameOriginResources: 1,
+      crossOriginResources: 0,
+      analyzableResources: 1,
+      analyzedResources: 1,
+      analyzedBytes: 18,
+      metadataOnlyResources: 0,
+      failedResources: 0,
+      skippedResources: 0,
+      failureReasons: {},
+      byKind: { script: 1 },
+      hosts: [{ host: "store.example", count: 1 }],
+    },
+    resources: [resource],
+    findings: [],
+    errors: [],
   };
 }
 

@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "rulesetVersion": "public-signals-v1.0.0",
+  "generatedAt": "2026-07-22",
+  "catalog": {
+    "stableRules": 40,
+    "stableApps": 32,
+    "stablePixels": 8,
+    "minimumSignalsPerRule": 2
+  },
+  "development": {
+    "positivePages": 120
+  },
+  "holdout": {
+    "positivePages": 119,
+    "negativePages": 40,
+    "positiveLabels": 119,
+    "missedLabels": 10,
+    "missedSampleIds": [
+      "holdout:app.okendo:prescription-swimming-goggles.co.uk:2",
+      "holdout:app.reviewsio:hatemeloveme.com:2",
+      "holdout:app.smile:zestandzing.com:1",
+      "holdout:app.smile:st-argo.com:2",
+      "holdout:app.smile:silkylicious.com:3",
+      "holdout:app.nosto:lspace.com:2",
+      "holdout:app.swym:ubarandco.com:1",
+      "holdout:app.swym:vadepekes.com:2",
+      "holdout:app.growave:yamamasa-koyamaen.com:2",
+      "holdout:pixel.clarity:butterflies-eyecare.co.uk:1"
+    ],
+    "unexpectedLabels": 0,
+    "falsePositivePages": 0,
+    "falseNegativeRate": 0.08403361344537816,
+    "pageFalsePositiveRate": 0
+  },
+  "thresholds": {
+    "maxFalseNegativeRate": 0.15,
+    "maxPageFalsePositiveRate": 0.05
+  },
+  "pass": true,
+  "methodology": {
+    "positives": "The original three URLScan-observed stores per rule are all treated as development data because rule authors saw them. After the rules and same-resource two-signal policy were frozen, a separate 119-page public holdout was sealed with two or three non-development stores per rule. Failed holdout rows remain in the metric and were not used to retune rules.",
+    "negatives": "Forty controlled hostname-only hard negatives share each vendor domain while omitting the independent pathname and body markers required by the rule.",
+    "scope": "Engineering fixture gate only; these rates do not claim population-wide coverage."
+  },
+  "limitations": [
+    "Server-side integrations and strict-sandbox Web Pixels can be invisible to main-page resource collection.",
+    "A public-browser signal match is not proof of installation ownership, event delivery, traffic, or sales volume."
+  ]
+}

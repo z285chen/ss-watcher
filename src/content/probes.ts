@@ -1,4 +1,10 @@
 import { isAllowedRouteRoot } from "../core/network/request-policy";
+import type {
+  CollectorResourceCandidate,
+  ResourceCandidateSource,
+  ResourceKind,
+  ResourceQueryPolicy,
+} from "../core/frontend/resource-types";
 
 export type AuthorizationProbeResult = {
   href: string;
@@ -160,6 +166,7 @@ export type CollectorProbeResult =
       pageProducts: CollectorPageProduct[];
       collectionHandles: string[];
       socials: CollectorSocialLink[];
+      resources?: CollectorResourceCandidate[];
     };
 
 export type CollectorSocialPlatform =
@@ -208,12 +215,16 @@ export function collectorProbe(input: {
   );
   const generator = document.querySelector<HTMLMetaElement>('meta[name="generator"]')
     ?.content;
+  const resourceMap = new Map<string, CollectorResourceCandidate>();
+  let resourceUrlBytes = 0;
+  addResourceCandidate(location.href, "document", "dom");
   const scriptUrls: string[] = [];
   let scriptUrlBytes = 0;
   const scripts = document.scripts;
   for (let index = 0; index < Math.min(scripts.length, 200); index += 1) {
     const script = scripts[index];
     if (script === undefined) continue;
+    addResourceCandidate(script.src, "script", "dom");
     const cleaned = cleanPublicUrl(script.src);
     if (cleaned === undefined) continue;
     const bytes = new TextEncoder().encode(cleaned).byteLength;
@@ -230,6 +241,7 @@ export function collectorProbe(input: {
   for (let index = 0; index < Math.min(links.length, 200); index += 1) {
     const link = links[index];
     if (link === undefined) continue;
+    addResourceCandidate(link.href, resourceKindForLink(link), "dom");
     const cleaned = cleanPublicUrl(link.href);
     if (cleaned === undefined) continue;
     const bytes = new TextEncoder().encode(cleaned).byteLength;
@@ -241,6 +253,37 @@ export function collectorProbe(input: {
       favicon = cleaned;
       faviconScore = score;
     }
+  }
+
+  const frames = document.querySelectorAll<HTMLIFrameElement>("iframe[src]");
+  for (let index = 0; index < Math.min(frames.length, 100); index += 1) {
+    const frame = frames[index];
+    if (frame !== undefined) addResourceCandidate(frame.src, "iframe", "dom");
+  }
+  const images = document.querySelectorAll<HTMLImageElement>("img[src]");
+  for (let index = 0; index < Math.min(images.length, 150); index += 1) {
+    const image = images[index];
+    if (image !== undefined) addResourceCandidate(image.src, "image", "dom");
+  }
+
+  try {
+    const timingEntries = globalThis.performance?.getEntriesByType?.("resource") ?? [];
+    for (let index = 0; index < Math.min(timingEntries.length, 300); index += 1) {
+      const entry = timingEntries[index];
+      if (entry === undefined || typeof entry.name !== "string") continue;
+      const timing = entry as PerformanceResourceTiming;
+      addResourceCandidate(
+        entry.name,
+        resourceKindForTiming(timing.initiatorType, entry.name),
+        "resource-timing",
+        timing.initiatorType,
+        finiteNonNegative(timing.transferSize),
+        finiteNonNegative(timing.duration),
+      );
+    }
+  } catch {
+    // Resource Timing is supplemental. DOM coverage remains authoritative when
+    // browsers, privacy settings or test environments omit timing entries.
   }
 
   // Checkout hand-offs are useful for distinguishing a Shopify commerce
@@ -300,7 +343,9 @@ export function collectorProbe(input: {
     }
     jsonLdBytes += bytes;
     try {
-      collectJsonLdProducts(JSON.parse(text));
+      const parsed: unknown = JSON.parse(text);
+      collectJsonLdProducts(parsed);
+      collectJsonLdSocials(parsed);
     } catch {
       // Malformed public JSON-LD is a skipped signal, never a probe failure.
     }
@@ -318,7 +363,135 @@ export function collectorProbe(input: {
     pageProducts: [...pageProductMap.values()],
     collectionHandles: [...collectionHandles],
     socials: [...socialMap].map(([platform, url]) => ({ platform, url })),
+    resources: [...resourceMap.values()],
   };
+
+  function addResourceCandidate(
+    rawUrl: string | undefined,
+    kind: ResourceKind,
+    source: ResourceCandidateSource,
+    initiator?: string,
+    transferSize?: number,
+    durationMs?: number,
+  ): void {
+    if (resourceMap.size >= 300) return;
+    const cleaned = cleanResourceUrl(rawUrl);
+    if (cleaned === undefined) return;
+    const key = `${kind}\u0000${cleaned.url}`;
+    const existing = resourceMap.get(key);
+    const bytes = new TextEncoder().encode(cleaned.url).byteLength;
+    if (existing === undefined && resourceUrlBytes + bytes > 160 * 1_024) return;
+    const selectedInitiator = existing?.initiator ?? initiator;
+    const selectedTransferSize = existing?.transferSize ?? transferSize;
+    const selectedDurationMs = existing?.durationMs ?? durationMs;
+    resourceMap.set(key, {
+      url: cleaned.url,
+      kind,
+      queryPolicy:
+        existing?.queryPolicy === "redacted" || cleaned.queryPolicy === "redacted"
+          ? "redacted"
+          : cleaned.queryPolicy,
+      sources: [...new Set([...(existing?.sources ?? []), source])],
+      ...(selectedInitiator === undefined
+        ? {}
+        : { initiator: selectedInitiator.slice(0, 64) }),
+      ...(selectedTransferSize === undefined
+        ? {}
+        : { transferSize: selectedTransferSize }),
+      ...(selectedDurationMs === undefined
+        ? {}
+        : { durationMs: selectedDurationMs }),
+    });
+    if (existing === undefined) resourceUrlBytes += bytes;
+  }
+
+  function resourceKindForLink(link: HTMLLinkElement): ResourceKind {
+    const rel = typeof link.rel === "string" ? link.rel.toLowerCase() : "";
+    const as = typeof link.as === "string" ? link.as.toLowerCase() : "";
+    const type = typeof link.type === "string" ? link.type.toLowerCase() : "";
+    if (rel.includes("stylesheet") || as === "style" || type === "text/css") {
+      return "style";
+    }
+    if (as === "script") return "script";
+    if (as === "font") return "font";
+    if (as === "image" || rel.includes("icon")) return "image";
+    if (type.includes("json")) {
+      return link.href.toLowerCase().includes(".map") ? "source-map" : "json";
+    }
+    return resourceKindFromUrl(link.href, "other");
+  }
+
+  function resourceKindForTiming(initiator: string, rawUrl: string): ResourceKind {
+    switch (initiator.toLowerCase()) {
+      case "script":
+        return "script";
+      case "link":
+      case "css":
+        return resourceKindFromUrl(rawUrl, "style");
+      case "img":
+      case "image":
+        return "image";
+      case "iframe":
+      case "frame":
+        return "iframe";
+      case "fetch":
+      case "xmlhttprequest":
+        return resourceKindFromUrl(rawUrl, "json");
+      default:
+        return resourceKindFromUrl(rawUrl, "other");
+    }
+  }
+
+  function resourceKindFromUrl(rawUrl: string, fallback: ResourceKind): ResourceKind {
+    try {
+      const pathname = new URL(rawUrl, location.href).pathname.toLowerCase();
+      if (pathname.endsWith(".map")) return "source-map";
+      if (/\.(?:m?js|cjs)$/u.test(pathname)) return "script";
+      if (pathname.endsWith(".css")) return "style";
+      if (/\.(?:json|jsonld)$/u.test(pathname)) return "json";
+      if (/\.(?:woff2?|ttf|otf|eot)$/u.test(pathname)) return "font";
+      if (/\.(?:avif|gif|jpe?g|png|svg|webp)$/u.test(pathname)) return "image";
+      return fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  function cleanResourceUrl(value: string | undefined):
+    | { url: string; queryPolicy: ResourceQueryPolicy }
+    | undefined {
+    if (value === undefined || value.length === 0) return undefined;
+    try {
+      const url = new URL(value, location.href);
+      if (
+        (url.protocol !== "http:" && url.protocol !== "https:") ||
+        url.username.length > 0 ||
+        url.password.length > 0
+      ) {
+        return undefined;
+      }
+      url.hash = "";
+      let queryPolicy: ResourceQueryPolicy = "none";
+      if (url.searchParams.size > 0) {
+        const safe = [...url.searchParams].every(
+          ([key, item]) =>
+            ["v", "ver", "version"].includes(key.toLowerCase()) &&
+            /^[a-zA-Z0-9._~-]{1,64}$/u.test(item),
+        );
+        queryPolicy = safe ? "cache-key" : "redacted";
+        if (!safe) url.search = "";
+      }
+      return url.href.length <= 2_048 ? { url: url.href, queryPolicy } : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function finiteNonNegative(value: unknown): number | undefined {
+    return typeof value === "number" && Number.isFinite(value) && value >= 0
+      ? value
+      : undefined;
+  }
 
   function scoreFaviconLink(link: HTMLLinkElement): number {
     const rel = typeof link.rel === "string" ? link.rel.toLowerCase() : "";
@@ -469,6 +642,66 @@ export function collectorProbe(input: {
         pending.push({ value, depth: current.depth + 1 });
       }
     }
+  }
+
+  function collectJsonLdSocials(root: unknown): void {
+    const pending: Array<{ value: unknown; depth: number }> = [
+      { value: root, depth: 0 },
+    ];
+    let visited = 0;
+    while (pending.length > 0 && visited < 500 && socialMap.size < 12) {
+      const current = pending.pop();
+      if (current === undefined) break;
+      visited += 1;
+      if (Array.isArray(current.value)) {
+        if (current.depth >= 8) continue;
+        for (const item of current.value.slice(0, 100)) {
+          pending.push({ value: item, depth: current.depth + 1 });
+        }
+        continue;
+      }
+      if (typeof current.value !== "object" || current.value === null) continue;
+      const record = current.value as Record<string, unknown>;
+      if (isJsonLdSocialOwnerType(record["@type"])) {
+        const values = Array.isArray(record.sameAs)
+          ? record.sameAs
+          : record.sameAs === undefined
+            ? []
+            : [record.sameAs];
+        for (const value of values.slice(0, 20)) {
+          const rawUrl = jsonLdUrl(value);
+          const cleaned = rawUrl === undefined ? undefined : cleanPublicUrl(rawUrl);
+          if (cleaned === undefined) continue;
+          const platform = socialPlatform(cleaned);
+          if (platform !== undefined && !socialMap.has(platform)) {
+            socialMap.set(platform, cleaned);
+          }
+          if (socialMap.size >= 12) break;
+        }
+      }
+      if (current.depth >= 8) continue;
+      for (const value of Object.values(record).slice(0, 100)) {
+        pending.push({ value, depth: current.depth + 1 });
+      }
+    }
+  }
+
+  function isJsonLdSocialOwnerType(value: unknown): boolean {
+    const allowed = new Set([
+      "brand",
+      "corporation",
+      "localbusiness",
+      "onlinestore",
+      "organization",
+      "store",
+      "website",
+    ]);
+    const values = Array.isArray(value) ? value : [value];
+    return values.some((entry) => {
+      if (typeof entry !== "string") return false;
+      const type = entry.split(/[\/#:]/u).at(-1)?.toLowerCase();
+      return type !== undefined && allowed.has(type);
+    });
   }
 
   function isJsonLdProductType(value: unknown): boolean {

@@ -2,6 +2,12 @@ import {
   checkPublicPath,
   type PathPolicyRejectionReason,
 } from "../core/security/path-policy";
+import {
+  MAX_DERIVED_SOURCE_MAPS,
+  MAX_RESOURCE_CAPABILITIES,
+  isResourceDescriptor,
+} from "../core/frontend/resource-policy";
+import type { ResourceDescriptor } from "../core/frontend/resource-types";
 
 export const DEFAULT_SESSION_TTL_MS = 30 * 60 * 1_000;
 export const SESSION_STORAGE_PREFIX = "scan-session:";
@@ -29,6 +35,8 @@ export type ScanSession = {
   authorizedAt: string;
   expiresAt: string;
   state: "active";
+  /** Page-observed, SW-registered capabilities; deleted with this session. */
+  resources?: ResourceDescriptor[];
 };
 
 export type SessionHandle = Pick<ScanSession, "runId" | "sessionToken">;
@@ -57,6 +65,15 @@ export type EstablishSessionResult =
 export type SessionValidationResult =
   | { ok: true; session: ScanSession }
   | { ok: false; reason: SessionFailureReason };
+
+export type DerivedResourceRegistrationResult =
+  | {
+      ok: true;
+      session: ScanSession;
+      resource: ResourceDescriptor;
+      created: boolean;
+    }
+  | { ok: false; reason: SessionFailureReason | "resource_limit" };
 
 export type EstablishSessionCandidate = {
   windowId: number;
@@ -192,6 +209,7 @@ export class SessionManager {
   readonly #extensionProtocol: string;
   readonly #extensionHost: string;
   readonly #sidePanelRoot: URL;
+  readonly #resourceMutationTails = new Map<string, Promise<void>>();
 
   constructor(api: SessionManagerChromeApi, options: SessionManagerOptions = {}) {
     this.#api = api;
@@ -425,14 +443,125 @@ export class SessionManager {
     return { ok: true, session };
   }
 
+  async replaceRegisteredResources(
+    handle: SessionHandle,
+    resources: readonly ResourceDescriptor[],
+  ): Promise<SessionValidationResult> {
+    if (
+      resources.length > MAX_RESOURCE_CAPABILITIES ||
+      resources.some((resource) => !isResourceDescriptor(resource)) ||
+      new Set(resources.map((resource) => resource.resourceId)).size !==
+        resources.length
+    ) {
+      return { ok: false, reason: "invalid_request" };
+    }
+    return this.#withResourceMutation(handle.runId, async () => {
+      const stored = await this.#readActiveSession(handle.runId);
+      if (!stored.ok) return stored;
+      if (!constantTimeEqual(handle.sessionToken, stored.session.sessionToken)) {
+        return this.#rejectAndRevoke(stored.session.runId, "session_mismatch");
+      }
+      const session: ScanSession = {
+        ...stored.session,
+        resources: resources.map((resource) => ({ ...resource })),
+      };
+      try {
+        await this.#api.storage.session.set({
+          [storageKey(session.runId)]: session,
+        });
+      } catch {
+        return { ok: false, reason: "storage_error" };
+      }
+      return { ok: true, session };
+    });
+  }
+
+  async registerDerivedResource(
+    handle: SessionHandle,
+    parentResourceId: string,
+    resource: ResourceDescriptor,
+  ): Promise<DerivedResourceRegistrationResult> {
+    if (
+      !isResourceDescriptor(resource) ||
+      resource.kind !== "source-map" ||
+      resource.originRelation !== "same-origin" ||
+      resource.fetchStatus !== "pending" ||
+      resource.queryPolicy === "redacted" ||
+      resource.sources.length !== 1 ||
+      resource.sources[0] !== "source-map-reference" ||
+      resource.derivedFromResourceId !== parentResourceId
+    ) {
+      return { ok: false, reason: "invalid_request" };
+    }
+
+    return this.#withResourceMutation(handle.runId, async () => {
+      const stored = await this.#readActiveSession(handle.runId);
+      if (!stored.ok) return stored;
+      if (!constantTimeEqual(handle.sessionToken, stored.session.sessionToken)) {
+        await this.#bestEffortRemove(storageKey(stored.session.runId));
+        return { ok: false, reason: "session_mismatch" };
+      }
+      const resources = stored.session.resources ?? [];
+      const parent = resources.find(
+        (candidate) => candidate.resourceId === parentResourceId,
+      );
+      if (
+        parent === undefined ||
+        parent.originRelation !== "same-origin" ||
+        (parent.kind !== "script" && parent.kind !== "style")
+      ) {
+        return { ok: false, reason: "invalid_request" };
+      }
+      const resourceUrl = new URL(resource.url);
+      if (resourceUrl.origin !== stored.session.origin) {
+        return { ok: false, reason: "invalid_request" };
+      }
+      const existing = resources.find(
+        (candidate) =>
+          candidate.kind === "source-map" && candidate.url === resource.url,
+      );
+      if (existing !== undefined) {
+        return {
+          ok: true,
+          session: stored.session,
+          resource: existing,
+          created: false,
+        };
+      }
+      const derivedCount = resources.filter((candidate) =>
+        candidate.sources.includes("source-map-reference"),
+      ).length;
+      if (
+        resources.length >= MAX_RESOURCE_CAPABILITIES ||
+        derivedCount >= MAX_DERIVED_SOURCE_MAPS
+      ) {
+        return { ok: false, reason: "resource_limit" };
+      }
+      const session: ScanSession = {
+        ...stored.session,
+        resources: [...resources, { ...resource }],
+      };
+      try {
+        await this.#api.storage.session.set({
+          [storageKey(session.runId)]: session,
+        });
+      } catch {
+        return { ok: false, reason: "storage_error" };
+      }
+      return { ok: true, session, resource, created: true };
+    });
+  }
+
   async revoke(runId: string): Promise<boolean> {
     if (!isValidRunId(runId)) return false;
-    try {
-      await this.#api.storage.session.remove(storageKey(runId));
-      return true;
-    } catch {
-      return false;
-    }
+    return this.#withResourceMutation(runId, async () => {
+      try {
+        await this.#api.storage.session.remove(storageKey(runId));
+        return true;
+      } catch {
+        return false;
+      }
+    });
   }
 
   async revokeByTab(tabId: number): Promise<number> {
@@ -690,18 +819,52 @@ export class SessionManager {
       return 0;
     }
 
-    const keysToRemove: string[] = [];
+    const runIdsToRemove: string[] = [];
+    const corruptKeysToRemove: string[] = [];
     for (const [key, value] of Object.entries(stored)) {
       if (!key.startsWith(SESSION_STORAGE_PREFIX)) continue;
-      if (!isScanSession(value) || predicate(value)) keysToRemove.push(key);
+      if (!isScanSession(value)) {
+        corruptKeysToRemove.push(key);
+      } else if (predicate(value)) {
+        runIdsToRemove.push(value.runId);
+      }
     }
-    if (keysToRemove.length === 0) return 0;
+    if (runIdsToRemove.length === 0 && corruptKeysToRemove.length === 0) return 0;
 
+    let removed = 0;
+    for (const runId of runIdsToRemove) {
+      if (await this.revoke(runId)) removed += 1;
+    }
+    if (corruptKeysToRemove.length > 0) {
+      try {
+        await this.#api.storage.session.remove(corruptKeysToRemove);
+        removed += corruptKeysToRemove.length;
+      } catch {
+        // Valid sessions have already been handled independently above.
+      }
+    }
+    return removed;
+  }
+
+  async #withResourceMutation<T>(
+    runId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.#resourceMutationTails.get(runId) ?? Promise.resolve();
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = () => resolve();
+    });
+    const tail = previous.catch(() => undefined).then(() => gate);
+    this.#resourceMutationTails.set(runId, tail);
+    await previous.catch(() => undefined);
     try {
-      await this.#api.storage.session.remove(keysToRemove);
-      return keysToRemove.length;
-    } catch {
-      return 0;
+      return await operation();
+    } finally {
+      release?.();
+      if (this.#resourceMutationTails.get(runId) === tail) {
+        this.#resourceMutationTails.delete(runId);
+      }
     }
   }
 
@@ -805,6 +968,17 @@ function isScanSession(value: unknown): value is ScanSession {
     typeof candidate.authorizedAt !== "string" ||
     typeof candidate.expiresAt !== "string" ||
     candidate.state !== "active"
+  ) {
+    return false;
+  }
+
+  if (
+    candidate.resources !== undefined &&
+    (!Array.isArray(candidate.resources) ||
+      candidate.resources.length > MAX_RESOURCE_CAPABILITIES ||
+      candidate.resources.some((resource) => !isResourceDescriptor(resource)) ||
+      new Set(candidate.resources.map((resource) => resource.resourceId)).size !==
+        candidate.resources.length)
   ) {
     return false;
   }

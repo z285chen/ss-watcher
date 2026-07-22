@@ -19,9 +19,19 @@ import {
 } from "../core/analysis/product-view";
 import type { StorefrontAnalysisResult } from "../core/analysis/storefront-analysis";
 import {
+  collectFrontendIntelligence,
+  type FrontendFinding,
+  type FrontendFindingCategory,
+  type FrontendIntelligenceResult,
+} from "../core/frontend/frontend-intelligence";
+import {
   createFullJsonExport,
   createProductCsvExport,
 } from "../core/export/snapshot-export";
+import {
+  collectPublicSourceBundle,
+  selectSourceBundleCandidates,
+} from "../core/export/source-bundle-export";
 import {
   StagingStore,
   type CommittedSnapshotBundle,
@@ -34,6 +44,7 @@ import {
 import type { StorefrontScanContext } from "../core/shopify/storefront-scanner";
 import { runIndexedDbSmoke } from "./indexeddb-smoke";
 import { createCommittedBundleState } from "./committed-bundle-state";
+import { shouldRetryActionAuthorization } from "./action-authorization-policy";
 import UiIcon from "./UiIcon.vue";
 
 import type {
@@ -42,6 +53,7 @@ import type {
   EndpointExecutorOptions,
 } from "../core/shopify/catalog-scanner";
 import type { EndpointRequest } from "../core/network/request-policy";
+import type { ResourceDescriptor } from "../core/frontend/resource-types";
 import type {
   CancelScanResponse,
   EndpointResponse,
@@ -50,11 +62,13 @@ import type {
   M0Request,
   M0Response,
   ProbeResponse,
+  ResourceResponse,
   RevokeResponse,
   SessionHandle,
+  ValidateSessionResponse,
 } from "../shared/messages";
 
-type ViewName = "overview" | "products" | "diagnostics";
+type ViewName = "overview" | "products" | "technology" | "diagnostics";
 type SnapshotStoreProfile = Readonly<{ favicon?: string }>;
 type SnapshotTheme = Readonly<{
   name?: string;
@@ -72,9 +86,14 @@ const handle = ref<SessionHandle>();
 const bootId = ref("");
 const routeRoot = ref("/");
 const sessionOrigin = ref("");
+const sessionTabId = ref<number>();
 const busy = ref(false);
 const scanController = ref<AbortController>();
 const activeScanId = ref<string>();
+const sourceExportBusy = ref(false);
+const sourceExportController = ref<AbortController>();
+const activeSourceExportId = ref<string>();
+const sourceExportProgress = ref("");
 const activeView = ref<ViewName>("overview");
 // Committed snapshots are immutable, atomically replaced values. Keeping the
 // bundle shallow prevents Vue from proxying IndexedDB records: structuredClone
@@ -125,6 +144,50 @@ const storeProfile = computed(() => storeProfileFromBundle(currentBundle.value))
 const theme = computed(() => themeFromBundle(currentBundle.value));
 const themeLabel = computed(() => displayTheme(theme.value));
 const socialLinks = computed(() => socialsFromBundle(currentBundle.value));
+const frontend = computed(() => frontendFromBundle(currentBundle.value));
+const frontendResources = computed(() => frontend.value?.resources ?? []);
+const visibleFrontendResources = computed(() => {
+  const all = frontendResources.value;
+  const prioritized = all.filter(
+    (resource) =>
+      resource.kind === "source-map" ||
+      resource.derivedFromResourceId !== undefined,
+  );
+  const prioritizedIds = new Set(
+    prioritized.map((resource) => resource.resourceId),
+  );
+  return [
+    ...prioritized,
+    ...all.filter((resource) => !prioritizedIds.has(resource.resourceId)),
+  ].slice(0, 100);
+});
+const frontendDegradation = computed(() => {
+  const summary = frontend.value?.summary;
+  if (summary === undefined) return undefined;
+  const failed = summary.failedResources ?? 0;
+  const skipped = summary.skippedResources ?? 0;
+  if (failed + skipped === 0) return undefined;
+  const reasons = Object.entries(summary.failureReasons ?? {})
+    .filter((entry): entry is [string, number] => typeof entry[1] === "number")
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .map(([reason, count]) => `${reason} ${count}`)
+    .join(" · ");
+  return `资源级降级：失败 ${failed}，跳过 ${skipped}${reasons.length === 0 ? "" : `；${reasons}`}`;
+});
+const sourceBundleCandidates = computed(() => {
+  const bundle = currentBundle.value;
+  if (bundle === undefined) return [];
+  return selectSourceBundleCandidates(
+    frontendResources.value,
+    bundle.snapshot.storeKey,
+  );
+});
+const sourceBundleEstimatedBytes = computed(() =>
+  sourceBundleCandidates.value.reduce(
+    (total, resource) => total + (resource.byteLength ?? 0),
+    0,
+  ),
+);
 
 watch(
   [
@@ -162,13 +225,42 @@ function isActionAuthorizedNotice(
 
 function handleRuntimeNotice(message: unknown): false {
   if (!isActionAuthorizedNotice(message)) return false;
-  void retryForActionWindow(message.windowId);
+  // A delayed notice for the same healthy document must not replace its
+  // resource-bearing session. A toolbar click on another tab (or after a
+  // navigation that revoked the stored session) must rebind the open panel.
+  if (busy.value || sourceExportBusy.value) {
+    return false;
+  }
+  void retryForActionWindow(message.windowId, message.tabId);
   return false;
 }
 
-async function retryForActionWindow(actionWindowId: number): Promise<void> {
+async function retryForActionWindow(
+  actionWindowId: number,
+  actionTabId: number,
+): Promise<void> {
+  if (busy.value || sourceExportBusy.value) return;
   const currentWindow = await chrome.windows.getCurrent();
-  if (currentWindow.id !== actionWindowId) return;
+  if (
+    !shouldRetryActionAuthorization({
+      actionWindowId,
+      currentWindowId: currentWindow.id,
+      operationBusy: busy.value || sourceExportBusy.value,
+    })
+  ) {
+    return;
+  }
+
+  const currentHandle = handle.value;
+  if (currentHandle !== undefined && sessionTabId.value === actionTabId) {
+    const validation = await send<ValidateSessionResponse>({
+      type: "M0_VALIDATE_SESSION",
+      handle: currentHandle,
+      panelInstanceId,
+    });
+    bootId.value = validation.bootId;
+    if (validation.ok) return;
+  }
   await establish();
 }
 
@@ -215,6 +307,7 @@ async function establish(): Promise<void> {
       sessionToken: response.session.sessionToken,
     };
     sessionOrigin.value = response.session.origin;
+    sessionTabId.value = response.session.tabId;
     routeRoot.value = "/";
     const latest = await stagingStore.getLatestCommittedSnapshot(
       response.session.origin,
@@ -222,7 +315,7 @@ async function establish(): Promise<void> {
     currentBundle.value = latest;
     status.value =
       latest === undefined
-        ? "ScanSession 已建立，可以开始 M2 扫描"
+        ? "ScanSession 已建立，可以开始 M3 扫描"
         : "ScanSession 已建立，已载入最近 committed 快照";
     detail.value = pretty({
       origin: response.session.origin,
@@ -235,10 +328,17 @@ async function establish(): Promise<void> {
   });
 }
 
-async function scanM2(): Promise<void> {
+async function scanM3(): Promise<void> {
   const sessionHandle = handle.value;
   const origin = sessionOrigin.value;
-  if (sessionHandle === undefined || origin.length === 0 || busy.value) return;
+  if (
+    sessionHandle === undefined ||
+    origin.length === 0 ||
+    busy.value ||
+    sourceExportBusy.value
+  ) {
+    return;
+  }
 
   busy.value = true;
   const controller = new AbortController();
@@ -246,19 +346,42 @@ async function scanM2(): Promise<void> {
   scanController.value = controller;
   activeScanId.value = scanId;
   try {
-    status.value = "M2：正在重新采集页面信号…";
+    status.value = "M3：正在重新采集页面与资源信号…";
     detail.value = "分类会重新运行 MAIN / ISOLATED 探针，不复用旧页面结果。";
     const probeResponse = await send<ProbeResponse>({
       type: "M0_RUN_PROBES",
       handle: sessionHandle,
       panelInstanceId,
+      scanId,
     });
+    throwIfScanAborted(controller.signal);
     bootId.value = probeResponse.bootId;
     if (!probeResponse.ok) {
       resetSession(probeResponse.message, errorDetail(probeResponse));
       return;
     }
     routeRoot.value = routeRootFromShopifyProbe(probeResponse.main);
+
+    const frontendPromise = collectFrontendIntelligence(
+      probeResponse.resources,
+      async (resourceId) => {
+        throwIfScanAborted(controller.signal);
+        const response = await send<ResourceResponse>({
+          type: "M3_FETCH_RESOURCE",
+          handle: sessionHandle,
+          panelInstanceId,
+          resourceId,
+          scanId,
+        });
+        bootId.value = response.bootId;
+        if (!response.ok) {
+          throw new SessionExecutionError(response.message, response);
+        }
+        throwIfScanAborted(controller.signal);
+        return response.result;
+      },
+      { signal: controller.signal },
+    );
 
     const execute: EndpointExecutor = async (
       endpoint: EndpointRequest,
@@ -297,16 +420,17 @@ async function scanM2(): Promise<void> {
       onProgress: updateCatalogProgress,
       retry: {
         onRetry: (event) => {
-          status.value = `M2：${event.endpointKind} 遇到 ${event.category}，${Math.round(event.delayMs / 1_000)} 秒后有限重试`;
+          status.value = `M3：${event.endpointKind} 遇到 ${event.category}，${Math.round(event.delayMs / 1_000)} 秒后有限重试`;
         },
       },
+      frontend: frontendPromise,
     });
 
     const committed = await stagingStore.getCommittedSnapshot(
       persisted.snapshotId,
     );
     if (committed === undefined) {
-      throw new Error("M2 快照提交后无法从 committed-only 读路径重新打开");
+      throw new Error("M3 快照提交后无法从 committed-only 读路径重新打开");
     }
     currentBundle.value = committed;
     activeView.value = "overview";
@@ -336,19 +460,30 @@ async function scanM2(): Promise<void> {
         candidateCount: persisted.analysis.newness.candidates.length,
       },
       runtimeDiagnostics: persisted.scan.runtimeDiagnostics,
+      frontend: frontendFromBundle(committed)?.summary,
       errors: committed.snapshot.errors,
     });
   } catch (error: unknown) {
-    if (isAbortError(error) || controller.signal.aborted) {
-      status.value = "M2 扫描已取消";
+    const wasCancelled = isAbortError(error) || controller.signal.aborted;
+    if (wasCancelled) {
+      status.value = "M3 扫描已取消";
       detail.value = "staging 数据已清理；未发布半成品快照。";
     } else if (error instanceof SessionExecutionError) {
       resetSession(error.message, errorDetail(error.response));
     } else {
-      status.value = "M2 扫描失败";
+      cancelActiveScan(new DOMException("M3 扫描失败", "AbortError"));
+      status.value = "M3 扫描失败";
       detail.value = error instanceof Error ? error.message : String(error);
     }
   } finally {
+    void chrome.runtime
+      .sendMessage({
+        type: "M3_FINISH_RESOURCE_SCAN",
+        handle: sessionHandle,
+        panelInstanceId,
+        scanId,
+      } satisfies M0Request)
+      .catch(() => undefined);
     if (scanController.value === controller) scanController.value = undefined;
     if (activeScanId.value === scanId) activeScanId.value = undefined;
     busy.value = false;
@@ -357,7 +492,7 @@ async function scanM2(): Promise<void> {
 
 function cancelScan(): void {
   cancelActiveScan(new DOMException("用户取消扫描", "AbortError"));
-  status.value = "正在取消 M2 扫描…";
+  status.value = "正在取消 M3 扫描…";
 }
 
 function cancelActiveScan(reason: DOMException): void {
@@ -379,23 +514,23 @@ function cancelActiveScan(reason: DOMException): void {
 
 function updateScanStage(stage: PersistedScanStage): void {
   const labels: Record<PersistedScanStage, string> = {
-    "meta-probe": "M2：探测 meta.json 能力…",
-    classification: "M2：计算 Shopify / storefrontKind…",
-    "cart-probe": "M2：验证匿名 cart currency…",
-    "anonymous-context": "M2：验证匿名 country / market…",
-    catalog: "M2：扫描产品目录…",
-    "price-verification": "M2：核对产品价格来源…",
-    statistics: "M2：计算店铺与产品统计…",
-    "best-selling": "M2：读取公开 best-selling 排序…",
-    "newness-order": "M2：读取 created-descending 排序…",
-    newness: "M2：生成 A–D 上新证据…",
+    "meta-probe": "M3：探测 meta.json 能力…",
+    classification: "M3：计算 Shopify / storefrontKind…",
+    "cart-probe": "M3：验证匿名 cart currency…",
+    "anonymous-context": "M3：验证匿名 country / market…",
+    catalog: "M3：扫描产品目录…",
+    "price-verification": "M3：核对产品价格来源…",
+    statistics: "M3：计算店铺与产品统计…",
+    "best-selling": "M3：读取公开 best-selling 排序…",
+    "newness-order": "M3：读取 created-descending 排序…",
+    newness: "M3：生成 A–D 上新证据…",
   };
   status.value = labels[stage];
 }
 
 function updateCatalogProgress(progress: CatalogProgress): void {
   const page = progress.page === undefined ? "" : `，第 ${progress.page} 页`;
-  status.value = `M2：${progress.phase}${page}，已发现 ${progress.productsFetched} 个产品`;
+  status.value = `M3：${progress.phase}${page}，已发现 ${progress.productsFetched} 个产品`;
 }
 
 function exportCsv(): void {
@@ -422,6 +557,128 @@ function exportJson(): void {
     "application/json;charset=utf-8",
   );
   status.value = `已导出完整 committed 快照（${exported.value.meta.rowCount} 个产品）`;
+}
+
+async function exportPublicSources(): Promise<void> {
+  const bundle = currentBundle.value;
+  const sessionHandle = handle.value;
+  const candidates = sourceBundleCandidates.value;
+  if (
+    bundle === undefined ||
+    sessionHandle === undefined ||
+    busy.value ||
+    sourceExportBusy.value
+  ) {
+    return;
+  }
+  if (candidates.length === 0) {
+    status.value = "当前会话没有可导出的同源正文";
+    detail.value = "请先重新扫描，建立与当前页面一致的资源 capability。";
+    return;
+  }
+
+  sourceExportBusy.value = true;
+  const controller = new AbortController();
+  const exportId = crypto.randomUUID();
+  sourceExportController.value = controller;
+  activeSourceExportId.value = exportId;
+  sourceExportProgress.value = `0 / ${candidates.length}`;
+  status.value = "正在重新验证并读取公开同源源码…";
+  try {
+    const exported = await collectPublicSourceBundle({
+      snapshotId: bundle.snapshot.snapshotId,
+      storeKey: bundle.snapshot.storeKey,
+      resources: candidates,
+      signal: controller.signal,
+      onProgress: (completed, total) => {
+        sourceExportProgress.value = `${completed} / ${total}`;
+        status.value = `正在导出公开源码 ${completed} / ${total}`;
+      },
+      execute: async (resourceId) => {
+        if (controller.signal.aborted) {
+          throw controller.signal.reason;
+        }
+        const response = await send<ResourceResponse>({
+          type: "M3_FETCH_RESOURCE",
+          handle: sessionHandle,
+          panelInstanceId,
+          resourceId,
+          scanId: exportId,
+        });
+        bootId.value = response.bootId;
+        if (!response.ok) {
+          throw new SessionExecutionError(response.message, response);
+        }
+        return response.result;
+      },
+    });
+    const exportedFileCount = exported.value.meta.exportedFileCount;
+    const exportedTextBytes = exported.value.meta.exportedTextBytes;
+    const exportStatus = exported.value.meta.status;
+    const errors = structuredClone(exported.value.errors);
+    if (exportedFileCount > 0) {
+      const filename = `${exportBaseName(bundle)}.public-sources.json`;
+      downloadText(filename, exported.json, "application/json;charset=utf-8");
+    }
+    exported.value.files.length = 0;
+    (exported as { json: string }).json = "";
+    status.value =
+      exportedFileCount === 0 &&
+      errors.some((error) => error.reason === "resource_not_registered")
+        ? "当前会话的资源 capability 已失效，请重新扫描"
+        : exportedFileCount === 0
+          ? "没有通过 ResourcePolicy 的源码文件，未创建下载"
+          : `已导出 ${exportedFileCount} 个公开同源源码文件`;
+    detail.value = pretty({
+      exportStatus,
+      exportedFileCount,
+      exportedTextBytes,
+      credentialMode: "omit",
+      redirectMode: "error",
+      errors,
+    });
+  } catch (error: unknown) {
+    if (isAbortError(error) || controller.signal.aborted) {
+      status.value = "公开源码导出已取消";
+      detail.value =
+        "已终止在途请求且清空本次会话的资源 capability；没有创建不完整下载。重新导出前请重新扫描。";
+    } else if (error instanceof SessionExecutionError) {
+      resetSession(error.message, errorDetail(error.response));
+    } else {
+      status.value = "公开源码导出失败";
+      detail.value = error instanceof Error ? error.message : String(error);
+    }
+  } finally {
+    void chrome.runtime
+      .sendMessage({
+        type: "M3_FINISH_RESOURCE_SCAN",
+        handle: sessionHandle,
+        panelInstanceId,
+        scanId: exportId,
+      } satisfies M0Request)
+      .catch(() => undefined);
+    if (sourceExportController.value === controller) {
+      sourceExportController.value = undefined;
+    }
+    if (activeSourceExportId.value === exportId) {
+      activeSourceExportId.value = undefined;
+    }
+    sourceExportProgress.value = "";
+    sourceExportBusy.value = false;
+  }
+}
+
+function cancelSourceExport(reason = "用户取消源码导出"): void {
+  sourceExportController.value?.abort(new DOMException(reason, "AbortError"));
+  const sessionHandle = handle.value;
+  const exportId = activeSourceExportId.value;
+  if (sessionHandle === undefined || exportId === undefined) return;
+  void send<CancelScanResponse>({
+    type: "M1_CANCEL_SCAN",
+    handle: sessionHandle,
+    panelInstanceId,
+    scanId: exportId,
+  }).catch(() => undefined);
 }
 
 function downloadText(filename: string, text: string, type: string): void {
@@ -525,7 +782,7 @@ async function runStorageSmoke(): Promise<void> {
 }
 
 async function runBusy(operation: () => Promise<void>): Promise<void> {
-  if (busy.value) return;
+  if (busy.value || sourceExportBusy.value) return;
   busy.value = true;
   try {
     await operation();
@@ -541,10 +798,12 @@ async function runBusy(operation: () => Promise<void>): Promise<void> {
 
 function resetSession(message: string, reason = ""): void {
   cancelActiveScan(new DOMException("会话已重置", "AbortError"));
+  cancelSourceExport("会话已重置");
   scanController.value = undefined;
   activeScanId.value = undefined;
   handle.value = undefined;
   sessionOrigin.value = "";
+  sessionTabId.value = undefined;
   routeRoot.value = "/";
   status.value = message;
   detail.value = reason;
@@ -556,9 +815,9 @@ function scanStatusLabel(scanStatus: string, analysisStatus: string): string {
     return "扫描遇到密码/挑战/安全拒绝，已提交可用的部分结果";
   }
   if (scanStatus === "partial" || analysisStatus === "partial") {
-    return "M2 扫描完成（部分覆盖），快照已原子提交";
+    return "M3 扫描完成（部分覆盖），快照已原子提交";
   }
-  return "M2 扫描与分析完成，快照已原子提交";
+  return "M3 扫描与前端分析完成，快照已原子提交";
 }
 
 function throwIfScanAborted(signal: AbortSignal): void {
@@ -616,6 +875,51 @@ function analysisFromBundle(
     isRecord(value.newness)
     ? (value as unknown as StorefrontAnalysisResult)
     : undefined;
+}
+
+function frontendFromBundle(
+  bundle: CommittedSnapshotBundle | undefined,
+): FrontendIntelligenceResult | undefined {
+  const value = bundle?.snapshot.frontend;
+  return isRecord(value) &&
+    isRecord(value.summary) &&
+    Array.isArray(value.resources) &&
+    Array.isArray(value.findings) &&
+    Array.isArray(value.errors)
+    ? (value as unknown as FrontendIntelligenceResult)
+    : undefined;
+}
+
+function technologyFindings(
+  categories: readonly FrontendFindingCategory[],
+): FrontendFinding[] {
+  return (frontend.value?.findings ?? []).filter((finding) =>
+    categories.includes(finding.category),
+  );
+}
+
+function resourceHost(resource: ResourceDescriptor): string {
+  try {
+    return new URL(resource.url).hostname;
+  } catch {
+    return "invalid";
+  }
+}
+
+function resourcePath(resource: ResourceDescriptor): string {
+  try {
+    const url = new URL(resource.url);
+    return `${url.pathname}${url.search}`;
+  } catch {
+    return resource.url;
+  }
+}
+
+function displayBytes(value: number | undefined): string {
+  if (value === undefined || !Number.isFinite(value)) return "—";
+  if (value < 1_024) return `${value} B`;
+  if (value < 1_024 * 1_024) return `${(value / 1_024).toFixed(1)} KB`;
+  return `${(value / (1_024 * 1_024)).toFixed(1)} MB`;
 }
 
 function contextFromBundle(
@@ -895,6 +1199,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   chrome.runtime.onMessage.removeListener(handleRuntimeNotice);
   cancelActiveScan(new DOMException("Side Panel 已关闭", "AbortError"));
+  cancelSourceExport("Side Panel 已关闭");
   void stagingStore.close();
 });
 </script>
@@ -908,7 +1213,7 @@ onBeforeUnmount(() => {
         </span>
         <div>
           <strong>SS Watcher</strong>
-          <small>STOREFRONT SIGNALS · M2</small>
+          <small>STOREFRONT SIGNALS · M3</small>
         </div>
       </div>
 
@@ -919,6 +1224,7 @@ onBeforeUnmount(() => {
           class="mini-action"
           title="导出产品 CSV"
           aria-label="导出产品 CSV"
+          :disabled="busy || sourceExportBusy"
           @click="exportCsv"
         >
           <UiIcon name="download" :size="15" />
@@ -930,6 +1236,7 @@ onBeforeUnmount(() => {
           class="mini-action"
           title="导出完整 JSON"
           aria-label="导出完整 JSON"
+          :disabled="busy || sourceExportBusy"
           @click="exportJson"
         >
           <UiIcon name="file" :size="15" />
@@ -938,9 +1245,9 @@ onBeforeUnmount(() => {
         <button
           type="button"
           class="scan-action"
-          data-testid="scan-m2"
-          :disabled="busy || !handle"
-          @click="scanM2"
+          data-testid="scan-m3"
+          :disabled="busy || sourceExportBusy || !handle"
+          @click="scanM3"
         >
           <UiIcon name="refresh" :size="15" />
           <span>{{ busy ? "扫描中" : currentBundle ? "重新扫描" : "开始扫描" }}</span>
@@ -949,7 +1256,7 @@ onBeforeUnmount(() => {
           v-if="scanController"
           type="button"
           class="icon-action danger"
-          data-testid="cancel-m2"
+          data-testid="cancel-m3"
           title="取消扫描"
           aria-label="取消扫描"
           @click="cancelScan"
@@ -961,7 +1268,7 @@ onBeforeUnmount(() => {
 
     <section
       class="status-strip"
-      :class="{ busy, offline: !handle, ready: currentBundle && !busy }"
+      :class="{ busy: busy || sourceExportBusy, offline: !handle, ready: currentBundle && !busy && !sourceExportBusy }"
       data-testid="session-status"
     >
       <span class="status-dot" aria-hidden="true" />
@@ -1045,6 +1352,16 @@ onBeforeUnmount(() => {
       </button>
       <button
         type="button"
+        :class="{ active: activeView === 'technology' }"
+        :aria-current="activeView === 'technology' ? 'page' : undefined"
+        @click="activeView = 'technology'"
+      >
+        <UiIcon name="code" />
+        <span>技术</span>
+        <b v-if="frontend">{{ frontend.findings.length }}</b>
+      </button>
+      <button
+        type="button"
         :class="{ active: activeView === 'diagnostics' }"
         :aria-current="activeView === 'diagnostics' ? 'page' : undefined"
         @click="activeView = 'diagnostics'"
@@ -1068,7 +1385,7 @@ onBeforeUnmount(() => {
         <h1>{{ handle ? "扫描当前 Shopify 店铺" : "先授权当前店铺" }}</h1>
         <p>
           {{ handle
-            ? "读取公开产品目录，并生成畅销排序、上新证据和店铺统计。"
+            ? "读取公开产品目录与当前页面资源，并生成产品、技术栈和代码引用证据。"
             : "回到公开店铺标签页点击扩展图标。面板不会自行获取新的 activeTab 授权。" }}
         </p>
       </div>
@@ -1076,7 +1393,7 @@ onBeforeUnmount(() => {
         type="button"
         class="empty-scan-action"
         :disabled="busy || !handle"
-        @click="scanM2"
+        @click="scanM3"
       >
         <UiIcon name="refresh" :size="16" />
         {{ handle ? "开始分析" : "等待授权" }}
@@ -1383,6 +1700,200 @@ onBeforeUnmount(() => {
           下一页 <UiIcon name="chevron-right" :size="16" />
         </button>
       </div>
+    </section>
+
+    <section v-else-if="activeView === 'technology'" class="view-content technology-view">
+      <header class="view-heading">
+        <div>
+          <p class="eyebrow">FRONTEND INTELLIGENCE</p>
+          <h1>前端技术</h1>
+        </div>
+        <span v-if="frontend" class="result-count" :class="{ offline: frontend.status !== 'completed' }">
+          {{ frontend.status.toUpperCase() }}
+        </span>
+      </header>
+
+      <template v-if="frontend">
+        <div class="metric-grid technology-metrics">
+          <article>
+            <span class="metric-icon purple"><UiIcon name="code" /></span>
+            <div><small>发现资源</small><strong>{{ frontend.summary.totalResources }}</strong></div>
+          </article>
+          <article>
+            <span class="metric-icon green"><UiIcon name="shield" /></span>
+            <div><small>同源已分析</small><strong>{{ frontend.summary.analyzedResources }}</strong></div>
+          </article>
+          <article>
+            <span class="metric-icon blue"><UiIcon name="layers" /></span>
+            <div><small>跨源元数据</small><strong>{{ frontend.summary.crossOriginResources }}</strong></div>
+          </article>
+          <article>
+            <span class="metric-icon amber"><UiIcon name="database" /></span>
+            <div><small>分析正文</small><strong>{{ displayBytes(frontend.summary.analyzedBytes) }}</strong></div>
+          </article>
+        </div>
+
+        <p class="technology-notice">
+          只读取当前页面实际观察到的同源公开文本资源；跨源资源固定为 metadata-only。代码引用不代表接口可访问。
+        </p>
+        <p class="technology-notice">
+          App / Pixel 使用本地稳定规则；严格沙箱或服务端 Pixel 可能不可见，命中仅表示公开技术信号，不代表访问量或事件已送达。
+        </p>
+        <p v-if="frontendDegradation" class="technology-notice warning">
+          {{ frontendDegradation }}。产品与已成功的技术结果仍已原子提交。
+        </p>
+
+        <section class="content-card source-export-card">
+          <header class="card-heading">
+            <div>
+              <span class="section-icon green"><UiIcon name="download" /></span>
+              <div><h2>公开源码导出</h2><p>独立于普通 JSON；点击后重新经过 ResourcePolicy</p></div>
+            </div>
+            <span class="data-pill">{{ sourceBundleCandidates.length }}</span>
+          </header>
+          <div class="source-export-body">
+            <div class="source-export-facts">
+              <span><small>同源文件</small><strong>{{ sourceBundleCandidates.length }}</strong></span>
+              <span><small>预计正文</small><strong>{{ displayBytes(sourceBundleEstimatedBytes) }}</strong></span>
+              <span><small>来源</small><strong>{{ storeHost }}</strong></span>
+            </div>
+            <p>
+              仅重新读取当前会话已注册、且上次分析成功的公开文本；固定 omit credentials、禁止重定向，最多 100 个文件 / 20 MB。
+            </p>
+            <div class="source-export-actions">
+              <button
+                type="button"
+                data-testid="export-public-sources"
+                :disabled="busy || sourceExportBusy || !handle || sourceBundleCandidates.length === 0"
+                @click="exportPublicSources"
+              >
+                <UiIcon name="download" :size="14" />
+                {{ sourceExportBusy ? `导出中 ${sourceExportProgress}` : "导出公开源码 JSON" }}
+              </button>
+              <button
+                v-if="sourceExportBusy"
+                type="button"
+                class="secondary"
+                data-testid="cancel-source-export"
+                @click="cancelSourceExport()"
+              >
+                取消
+              </button>
+            </div>
+            <p v-if="sourceBundleCandidates.length === 0" class="source-export-empty">
+              当前快照没有已分析的同源文本；请先点击“重新扫描”。
+            </p>
+          </div>
+        </section>
+
+        <section class="content-card technology-card">
+          <header class="card-heading">
+            <div>
+              <span class="section-icon purple"><UiIcon name="layers" /></span>
+              <div><h2>技术栈与主题</h2><p>公开资源和代码特征</p></div>
+            </div>
+            <span class="data-pill">{{ technologyFindings(['framework', 'theme']).length }}</span>
+          </header>
+          <ul v-if="technologyFindings(['framework', 'theme']).length" class="finding-list">
+            <li v-for="finding in technologyFindings(['framework', 'theme'])" :key="finding.findingId">
+              <div><strong>{{ finding.label }}</strong><small>置信度 {{ Math.round(finding.confidence * 100) }}% · {{ finding.maturity }}</small></div>
+              <details>
+                <summary>{{ finding.evidence.length }} 条证据</summary>
+                <p v-for="evidence in finding.evidence" :key="`${evidence.resourceId}-${evidence.excerpt}`">{{ evidence.excerpt }}</p>
+              </details>
+            </li>
+          </ul>
+          <p v-else class="empty-copy">未发现足以展示的框架或主题代码特征。</p>
+        </section>
+
+        <section class="content-card technology-card">
+          <header class="card-heading">
+            <div>
+              <span class="section-icon blue"><UiIcon name="code" /></span>
+              <div><h2>API 代码引用</h2><p>仅表示字符串或 operation 出现在公开代码中</p></div>
+            </div>
+            <span class="data-pill">{{ technologyFindings(['api-reference']).length }}</span>
+          </header>
+          <ul v-if="technologyFindings(['api-reference']).length" class="finding-list compact">
+            <li v-for="finding in technologyFindings(['api-reference']).slice(0, 30)" :key="finding.findingId">
+              <div><strong>{{ finding.label }}</strong><small>{{ finding.evidence[0]?.excerpt }}</small></div>
+            </li>
+          </ul>
+          <p v-else class="empty-copy">未发现公开 API 路径或 GraphQL operation 引用。</p>
+        </section>
+
+        <section class="content-card technology-card">
+          <header class="card-heading">
+            <div>
+              <span class="section-icon green"><UiIcon name="radar" /></span>
+              <div><h2>App 与 Pixel</h2><p>稳定规则 {{ frontend.fingerprintRulesVersion }}；不推导销量或访问量</p></div>
+            </div>
+            <span class="data-pill">{{ technologyFindings(['app', 'pixel']).length }}</span>
+          </header>
+          <ul v-if="technologyFindings(['app', 'pixel']).length" class="finding-list">
+            <li v-for="finding in technologyFindings(['app', 'pixel'])" :key="finding.findingId">
+              <div>
+                <strong>{{ finding.label }}</strong>
+                <small>{{ finding.category.toUpperCase() }} · 置信度 {{ Math.round(finding.confidence * 100) }}% · {{ finding.maturity }}</small>
+              </div>
+              <details>
+                <summary>{{ finding.evidence.length }} 条规则命中</summary>
+                <p v-for="evidence in finding.evidence" :key="`${evidence.resourceId}-${evidence.excerpt}`">{{ evidence.excerpt }}</p>
+              </details>
+            </li>
+          </ul>
+          <p v-else class="empty-copy">当前规则未发现可展示的 App / Pixel 证据。</p>
+        </section>
+
+        <section class="content-card technology-card">
+          <header class="card-heading">
+            <div>
+              <span class="section-icon amber"><UiIcon name="trend" /></span>
+              <div><h2>性能与 Source Map</h2><p>Resource Timing 与静态边界检查</p></div>
+            </div>
+            <span class="data-pill">{{ technologyFindings(['performance', 'source-map']).length }}</span>
+          </header>
+          <ul v-if="technologyFindings(['performance', 'source-map']).length" class="finding-list compact">
+            <li v-for="finding in technologyFindings(['performance', 'source-map'])" :key="finding.findingId">
+              <div><strong>{{ finding.label }}</strong><small>{{ finding.evidence[0]?.excerpt }}</small></div>
+            </li>
+          </ul>
+          <p v-else class="empty-copy">没有超过静态阈值的性能或 source map 发现。</p>
+        </section>
+
+        <section class="content-card resource-inventory">
+          <header class="card-heading">
+            <div>
+              <span class="section-icon blue"><UiIcon name="database" /></span>
+              <div><h2>资源清单</h2><p>URL 已去 fragment；危险 query 不可重放</p></div>
+            </div>
+            <span class="data-pill">{{ frontendResources.length }}</span>
+          </header>
+          <div class="resource-list">
+            <article v-for="resource in visibleFrontendResources" :key="resource.resourceId">
+              <span class="resource-kind">{{ resource.kind }}</span>
+              <div>
+                <strong>{{ resourceHost(resource) }}</strong>
+                <small :title="resource.url">{{ resourcePath(resource) }}</small>
+                <small v-if="resource.derivedFromResourceId">
+                  SW 派生 capability · parent {{ resource.derivedFromResourceId.slice(0, 8) }}
+                </small>
+              </div>
+              <p>
+                <span :class="`resource-status ${resource.fetchStatus}`">{{ resource.fetchStatus }}</span>
+                <small>{{ displayBytes(resource.byteLength ?? resource.transferSize) }}</small>
+              </p>
+            </article>
+          </div>
+          <p v-if="frontendResources.length > 100" class="disclaimer">界面仅显示前 100 条；完整脱敏清单包含在 JSON 导出中。</p>
+        </section>
+      </template>
+
+      <section v-else class="empty-results technology-empty">
+        <UiIcon name="code" :size="26" />
+        <strong>当前快照尚无前端资源分析</strong>
+        <span>点击“重新扫描”生成 M3 Technology 结果；旧 M2 快照仍可继续查看产品数据。</span>
+      </section>
     </section>
 
     <section v-else class="view-content diagnostics-view">

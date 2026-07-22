@@ -79,6 +79,33 @@ describe("Shopify multi-signal detection", () => {
     });
   });
 
+  it("classifies an Oxygen-hosted Hydrogen storefront as custom", () => {
+    const detection = classifyShopifyStorefront({
+      origin,
+      main: null,
+      collector: collector({
+        linkUrls: [
+          "https://cdn.shopify.com/oxygen-v2/26673/17912/assets/app.css",
+        ],
+      }),
+    });
+
+    expect(detection).toMatchObject({
+      isShopify: true,
+      storefrontKind: "custom-storefront",
+      cartProbeEligible: false,
+      confidence: 0.92,
+    });
+    expect(detection.evidence).toContainEqual(
+      expect.objectContaining({
+        id: "collector-oxygen-asset",
+        group: "oxygen-hosting",
+        strength: "strong",
+        effect: "custom",
+      }),
+    );
+  });
+
   it("does not treat a single generic CDN reference as Shopify", () => {
     const detection = classifyShopifyStorefront({
       origin,

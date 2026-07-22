@@ -69,6 +69,49 @@ describe("M2 snapshot exports", () => {
     expect(exported.value.products[0]?.value.title).toBe(long);
     expect(JSON.parse(exported.json).products[0].value.title).toBe(long);
   });
+
+  it("strips raw frontend body fields from the standard JSON export", () => {
+    const bundle = fixtureBundle();
+    Object.assign(bundle.snapshot, {
+      frontend: {
+        resources: [
+          {
+            resourceId: "resource-1",
+            url: "https://store.example/theme.js",
+            sha256: "a".repeat(64),
+            text: "RAW_SNAPSHOT_SOURCE",
+          },
+        ],
+      },
+    });
+    bundle.moduleResults.push({
+      schemaVersion: 1,
+      snapshotId: "snapshot-1",
+      moduleId: "frontend-intelligence",
+      status: "completed",
+      result: {
+        findings: [{ excerpt: "safe short evidence" }],
+        sourceText: "RAW_MODULE_SOURCE",
+        nested: { sourcesContent: ["RAW_MAP_SOURCE"] },
+      },
+    });
+
+    const exported = createFullJsonExport(
+      bundle,
+      "2026-07-20T00:00:00.000Z",
+    );
+
+    expect(exported.value.meta).toMatchObject({
+      fieldsSanitized: true,
+      rawSourceIncluded: false,
+      removedRawSourceFieldCount: 3,
+    });
+    expect(exported.json).not.toContain("RAW_SNAPSHOT_SOURCE");
+    expect(exported.json).not.toContain("RAW_MODULE_SOURCE");
+    expect(exported.json).not.toContain("RAW_MAP_SOURCE");
+    expect(exported.json).toContain("safe short evidence");
+    expect(exported.json).toContain(`\"sha256\": \"${"a".repeat(64)}\"`);
+  });
 });
 
 function fixtureBundle(): CommittedSnapshotBundle {

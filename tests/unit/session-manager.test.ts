@@ -10,6 +10,7 @@ import {
   type SessionStorageArea,
   type TabLike,
 } from "../../src/background/session-manager";
+import type { ResourceDescriptor } from "../../src/core/frontend/resource-types";
 
 const EXTENSION_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const EXTENSION_ORIGIN = `chrome-extension://${EXTENSION_ID}`;
@@ -397,6 +398,151 @@ describe("SessionManager", () => {
       reason: "authorization_race",
     });
     expect(fixture.storage.values).toEqual({});
+  });
+
+  it("stores only validated resource capabilities with the session and deletes them on revoke", async () => {
+    const fixture = createFixture();
+    const established = await establish(fixture, "run-resources");
+    const resource: ResourceDescriptor = {
+      resourceId: "00000000-0000-4000-8000-000000000001",
+      url: "https://shop.example/assets/theme.js",
+      originRelation: "same-origin",
+      kind: "script",
+      queryPolicy: "none",
+      sources: ["dom"],
+      fetchStatus: "pending",
+    };
+
+    const replaced = await fixture.manager.replaceRegisteredResources(
+      established.handle,
+      [resource],
+    );
+    expect(replaced).toMatchObject({
+      ok: true,
+      session: { resources: [resource] },
+    });
+    await expect(
+      fixture.manager.validateForExecution(established.handle),
+    ).resolves.toMatchObject({ ok: true, session: { resources: [resource] } });
+
+    await expect(fixture.manager.revoke(established.session.runId)).resolves.toBe(
+      true,
+    );
+    expect(fixture.storage.values).toEqual({});
+  });
+
+  it("serializes and deduplicates SW-derived source-map capabilities", async () => {
+    const fixture = createFixture();
+    const established = await establish(fixture, "run-derived-maps");
+    const parent: ResourceDescriptor = {
+      resourceId: "00000000-0000-4000-8000-000000000001",
+      url: "https://shop.example/assets/theme.js",
+      originRelation: "same-origin",
+      kind: "script",
+      queryPolicy: "none",
+      sources: ["dom"],
+      fetchStatus: "pending",
+    };
+    await fixture.manager.replaceRegisteredResources(established.handle, [parent]);
+    const first: ResourceDescriptor = {
+      resourceId: "00000000-0000-4000-8000-000000000002",
+      url: "https://shop.example/assets/theme.js.map",
+      originRelation: "same-origin",
+      kind: "source-map",
+      queryPolicy: "none",
+      sources: ["source-map-reference"],
+      derivedFromResourceId: parent.resourceId,
+      fetchStatus: "pending",
+    };
+    const second: ResourceDescriptor = {
+      ...first,
+      resourceId: "00000000-0000-4000-8000-000000000003",
+      url: "https://shop.example/assets/vendor.js.map",
+    };
+
+    const registered = await Promise.all([
+      fixture.manager.registerDerivedResource(
+        established.handle,
+        parent.resourceId,
+        first,
+      ),
+      fixture.manager.registerDerivedResource(
+        established.handle,
+        parent.resourceId,
+        second,
+      ),
+    ]);
+    expect(registered).toEqual([
+      expect.objectContaining({ ok: true, created: true, resource: first }),
+      expect.objectContaining({ ok: true, created: true, resource: second }),
+    ]);
+
+    const duplicate = await fixture.manager.registerDerivedResource(
+      established.handle,
+      parent.resourceId,
+      { ...first, resourceId: "00000000-0000-4000-8000-000000000004" },
+    );
+    expect(duplicate).toMatchObject({
+      ok: true,
+      created: false,
+      resource: { resourceId: first.resourceId },
+    });
+    await expect(
+      fixture.manager.validateForExecution(established.handle),
+    ).resolves.toMatchObject({
+      ok: true,
+      session: { resources: [parent, first, second] },
+    });
+
+    await fixture.manager.revoke(established.session.runId);
+    expect(fixture.storage.values).toEqual({});
+  });
+
+  it("clears parent and derived capabilities on cancellation without deleting the session", async () => {
+    const fixture = createFixture();
+    const established = await establish(fixture, "run-cancel-resources");
+    const parent: ResourceDescriptor = {
+      resourceId: "00000000-0000-4000-8000-000000000001",
+      url: "https://shop.example/assets/theme.js",
+      originRelation: "same-origin",
+      kind: "script",
+      queryPolicy: "none",
+      sources: ["dom"],
+      fetchStatus: "pending",
+    };
+    const derived: ResourceDescriptor = {
+      resourceId: "00000000-0000-4000-8000-000000000002",
+      url: "https://shop.example/assets/theme.js.map",
+      originRelation: "same-origin",
+      kind: "source-map",
+      queryPolicy: "none",
+      sources: ["source-map-reference"],
+      derivedFromResourceId: parent.resourceId,
+      fetchStatus: "pending",
+    };
+
+    await fixture.manager.replaceRegisteredResources(established.handle, [parent]);
+    await fixture.manager.registerDerivedResource(
+      established.handle,
+      parent.resourceId,
+      derived,
+    );
+    await expect(
+      fixture.manager.replaceRegisteredResources(established.handle, []),
+    ).resolves.toMatchObject({ ok: true, session: { resources: [] } });
+    await expect(
+      fixture.manager.validateForExecution(established.handle),
+    ).resolves.toMatchObject({ ok: true, session: { resources: [] } });
+
+    // A source-map registration that reaches the serialized mutation queue
+    // after cancellation cannot resurrect a capability without its parent.
+    await expect(
+      fixture.manager.registerDerivedResource(
+        established.handle,
+        parent.resourceId,
+        { ...derived, resourceId: "00000000-0000-4000-8000-000000000003" },
+      ),
+    ).resolves.toEqual({ ok: false, reason: "invalid_request" });
   });
 
   it("requires the bound Chrome window to remain focused", async () => {

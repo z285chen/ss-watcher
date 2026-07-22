@@ -17,6 +17,7 @@ export type ShopifySignalGroup =
   | "theme-asset"
   | "generator"
   | "commerce-cdn"
+  | "oxygen-hosting"
   | "checkout-handoff"
   | "meta-endpoint"
   | "cart-endpoint";
@@ -132,16 +133,28 @@ export function classifyShopifyStorefront(
         detail: safeUrlDetail(hostedAsset),
       });
     } else {
-      const commerceAsset = publicUrls.find(isShopifyCdnUrl);
-      if (commerceAsset !== undefined) {
+      const oxygenAsset = publicUrls.find(isOxygenAssetUrl);
+      if (oxygenAsset !== undefined) {
         add({
-          id: "collector-shopify-cdn",
+          id: "collector-oxygen-asset",
           source: "collector",
-          group: "commerce-cdn",
-          strength: "weak",
-          effect: "shopify",
-          detail: safeUrlDetail(commerceAsset),
+          group: "oxygen-hosting",
+          strength: "strong",
+          effect: "custom",
+          detail: safeUrlDetail(oxygenAsset),
         });
+      } else {
+        const commerceAsset = publicUrls.find(isShopifyCdnUrl);
+        if (commerceAsset !== undefined) {
+          add({
+            id: "collector-shopify-cdn",
+            source: "collector",
+            group: "commerce-cdn",
+            strength: "weak",
+            effect: "shopify",
+            detail: safeUrlDetail(commerceAsset),
+          });
+        }
       }
     }
 
@@ -241,6 +254,9 @@ export function classifyShopifyStorefront(
   const hasCustomHandoff = evidence.some(
     (item) => item.id === "collector-checkout-handoff" && item.effect === "custom",
   );
+  const hasOxygenHosting = evidence.some(
+    (item) => item.id === "collector-oxygen-asset",
+  );
 
   let storefrontKind: StorefrontKind = "uncertain";
   const reasons: string[] = [];
@@ -249,9 +265,17 @@ export function classifyShopifyStorefront(
   } else if (hasCompleteRuntime && hasHostedAsset && cartSucceeded) {
     storefrontKind = "hosted-theme";
     reasons.push("theme runtime、托管主题资产与匿名 cart-context 三方一致");
-  } else if (hasCustomHandoff && !hasCompleteRuntime && !hasHostedAsset) {
+  } else if (
+    (hasCustomHandoff || hasOxygenHosting) &&
+    !hasCompleteRuntime &&
+    !hasHostedAsset
+  ) {
     storefrontKind = "custom-storefront";
-    reasons.push("存在跨 origin Shopify checkout hand-off，但无托管主题 runtime/asset 组合");
+    reasons.push(
+      hasOxygenHosting
+        ? "观察到 Shopify Oxygen 托管资源，但无托管主题 runtime/asset 组合"
+        : "存在跨 origin Shopify checkout hand-off，但无托管主题 runtime/asset 组合",
+    );
   } else {
     reasons.push("Shopify 已识别，但 hosted-theme 的三项门控未同时满足");
     if (input.cartContext === undefined && cartProbeEligible) {
@@ -319,6 +343,15 @@ function isHostedThemeAssetUrl(value: string, storefrontOrigin: string): boolean
 function isShopifyCdnUrl(value: string): boolean {
   const url = safeUrl(value);
   return url !== undefined && isShopifyCdnHost(url.hostname);
+}
+
+function isOxygenAssetUrl(value: string): boolean {
+  const url = safeUrl(value);
+  return (
+    url !== undefined &&
+    isShopifyCdnHost(url.hostname) &&
+    /^\/oxygen(?:-v\d+)?\//iu.test(url.pathname)
+  );
 }
 
 function isShopifyCdnHost(hostname: string): boolean {
