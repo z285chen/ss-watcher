@@ -22,7 +22,21 @@ withDefaults(
       | "database"
       | "code"
       | "revoke"
-      | "cancel";
+      | "cancel"
+      | "more"
+      | "copy"
+      | "arrow-up-right"
+      | "chevron-down"
+      | "chevron-up"
+      | "close"
+      | "check"
+      | "alert"
+      | "lock"
+      | "globe"
+      | "sparkle"
+      | "sliders"
+      | "external"
+      | "menu";
     size?: number;
   }>(),
   { size: 18 },
@@ -109,6 +123,51 @@ withDefaults(
     </template>
     <template v-else-if="name === 'revoke'">
       <path d="M5 5l14 14M10 4.5A8 8 0 0 1 19.5 14M14 19.5A8 8 0 0 1 4.5 10" />
+    </template>
+    <template v-else-if="name === 'more'">
+      <circle cx="5" cy="12" r="1" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" />
+      <circle cx="19" cy="12" r="1" fill="currentColor" stroke="none" />
+    </template>
+    <template v-else-if="name === 'copy'">
+      <rect x="8" y="8" width="11" height="12" rx="1.5" />
+      <path d="M16 8V5.5A1.5 1.5 0 0 0 14.5 4h-9A1.5 1.5 0 0 0 4 5.5v10A1.5 1.5 0 0 0 5.5 17H8" />
+    </template>
+    <template v-else-if="name === 'arrow-up-right' || name === 'external'">
+      <path d="M7 17 17 7M9 7h8v8" />
+    </template>
+    <template v-else-if="name === 'chevron-down'">
+      <path d="m6 9 6 6 6-6" />
+    </template>
+    <template v-else-if="name === 'chevron-up'">
+      <path d="m6 15 6-6 6 6" />
+    </template>
+    <template v-else-if="name === 'close'">
+      <path d="m6 6 12 12M18 6 6 18" />
+    </template>
+    <template v-else-if="name === 'check'">
+      <path d="m5 12 4.2 4.2L19 6.5" />
+    </template>
+    <template v-else-if="name === 'alert'">
+      <path d="m12 3 9 17H3z" />
+      <path d="M12 9v4M12 17h.01" />
+    </template>
+    <template v-else-if="name === 'lock'">
+      <rect x="5" y="10" width="14" height="10" rx="2" />
+      <path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v2" />
+    </template>
+    <template v-else-if="name === 'globe'">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3 12h18M12 3c2.2 2.4 3.3 5.4 3.3 9S14.2 18.6 12 21c-2.2-2.4-3.3-5.4-3.3-9S9.8 5.4 12 3" />
+    </template>
+    <template v-else-if="name === 'sparkle'">
+      <path d="m12 3 1.2 5.8L19 10l-5.8 1.2L12 17l-1.2-5.8L5 10l5.8-1.2zM19 16l.5 2.5L22 19l-2.5.5L19 22l-.5-2.5L16 19l2.5-.5z" />
+    </template>
+    <template v-else-if="name === 'sliders'">
+      <path d="M4 7h16M4 17h16M8 4v6M16 14v6" />
+    </template>
+    <template v-else-if="name === 'menu'">
+      <path d="M4 7h16M4 12h16M4 17h16" />
     </template>
     <template v-else>
       <path d="m6 6 12 12M18 6 6 18" />

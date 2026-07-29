@@ -159,14 +159,18 @@ export async function collectFrontendIntelligence(
   const findings = analyzeResources(resources, bodies);
   bodies.length = 0;
   const summary = summarizeResources(resources, analyzedBytes);
-  const partial = errors.length > 0 || resources.some(
+  const coreResources = resources.filter(isCoreAnalysisResource);
+  const coreDegraded = coreResources.some(
     (resource) => resource.fetchStatus === "failed" || resource.fetchStatus === "skipped",
   );
+  const analyzedCoreResources = coreResources.filter(
+    (resource) => resource.fetchStatus === "analyzed",
+  ).length;
   return {
     status:
-      resources.length > 0 && summary.analyzedResources === 0 && errors.length > 0
+      coreResources.length > 0 && analyzedCoreResources === 0 && errors.length > 0
         ? "failed"
-        : partial
+        : coreDegraded
           ? "partial"
           : "completed",
     analyzerVersion: "token-url-v2",
@@ -194,7 +198,7 @@ export async function collectFrontendIntelligence(
       try {
         result = await execute(target.resourceId);
       } catch (error: unknown) {
-        errors.push(`${target.resourceId}: ${errorMessage(error)}`);
+        recordCoreError(target, errorMessage(error));
         updateResource(target.resourceId, {
           fetchStatus: "failed",
           failureReason: "network_error",
@@ -202,7 +206,7 @@ export async function collectFrontendIntelligence(
         continue;
       }
       if (!result.ok) {
-        errors.push(`${target.resourceId}: ${result.reason}`);
+        recordCoreError(target, result.reason);
         updateResource(
           target.resourceId,
           result.descriptor ?? {
@@ -219,7 +223,7 @@ export async function collectFrontendIntelligence(
           fetchStatus: "skipped",
           failureReason: "budget_exceeded",
         });
-        errors.push(`${target.resourceId}: budget_exceeded`);
+        recordCoreError(target, "budget_exceeded");
         continue;
       }
       analyzedBytes += byteLength;
@@ -236,10 +240,10 @@ export async function collectFrontendIntelligence(
         descriptorIndex.set(derived.resourceId, resources.length);
         const copied = { ...derived };
         resources.push(copied);
-        // Prefer a map immediately after its parent while keeping the global
-        // body budget unchanged. Remaining ordinary resources are not lost;
-        // they continue if the map is absent or rejected.
-        pending.splice(nextIndex, 0, copied);
+        // Source maps are optional reconstruction aids. Queue them after every
+        // already-observed core resource so a map cannot consume one of the
+        // bounded body slots that would otherwise analyze public JS/CSS/HTML.
+        pending.push(copied);
       }
     }
   }
@@ -253,6 +257,21 @@ export async function collectFrontendIntelligence(
     if (index === undefined || current === undefined) return;
     resources[index] = { ...current, ...patch };
   }
+
+  function recordCoreError(resource: ResourceDescriptor, reason: string): void {
+    if (!isCoreAnalysisResource(resource)) return;
+    errors.push(`${resource.resourceId}: ${reason}`);
+  }
+}
+
+/**
+ * Source maps improve source reconstruction but are not required to inspect
+ * public HTML/JS/CSS/JSON or to derive technology evidence. Keep their
+ * availability in the resource ledger without turning a completed scan into a
+ * global partial result.
+ */
+function isCoreAnalysisResource(resource: ResourceDescriptor): boolean {
+  return resource.kind !== "source-map";
 }
 
 export function emptyFrontendIntelligence(

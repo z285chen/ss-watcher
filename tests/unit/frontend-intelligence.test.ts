@@ -179,6 +179,165 @@ describe("Frontend Intelligence", () => {
     expect(JSON.stringify(result)).not.toContain("RAW_MAP_SOURCE_SENTINEL");
   });
 
+  it("keeps an unavailable Source Map as low-impact evidence instead of downgrading core analysis", async () => {
+    const parent = descriptor(
+      1,
+      "https://store.example/assets/theme.js",
+      "script",
+    );
+    const derived: ResourceDescriptor = {
+      resourceId: "00000000-0000-4000-8000-000000000004",
+      url: "https://store.example/assets/theme.js.map",
+      originRelation: "same-origin",
+      kind: "source-map",
+      queryPolicy: "none",
+      sources: ["source-map-reference"],
+      derivedFromResourceId: parent.resourceId,
+      fetchStatus: "pending",
+    };
+
+    const result = await collectFrontendIntelligence([parent], async (resourceId) => {
+      if (resourceId === parent.resourceId) {
+        const text = "const theme = true;\n//# sourceMappingURL=theme.js.map";
+        return {
+          ok: true as const,
+          resourceId,
+          descriptor: {
+            ...parent,
+            fetchStatus: "analyzed" as const,
+            contentType: "text/javascript",
+            byteLength: text.length,
+            sha256: "e".repeat(64),
+          },
+          text,
+          derivedResources: [derived],
+        };
+      }
+      return {
+        ok: false as const,
+        resourceId,
+        reason: "http_error" as const,
+        status: 404,
+        descriptor: {
+          ...derived,
+          fetchStatus: "failed" as const,
+          failureReason: "http_error" as const,
+          httpStatus: 404,
+        },
+      };
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.errors).toEqual([]);
+    expect(result.summary).toMatchObject({
+      analyzedResources: 1,
+      failedResources: 1,
+      failureReasons: { http_error: 1 },
+    });
+    expect(result.resources).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          resourceId: derived.resourceId,
+          kind: "source-map",
+          fetchStatus: "failed",
+          failureReason: "http_error",
+          httpStatus: 404,
+        }),
+      ]),
+    );
+  });
+
+  it("does not let an optional Source Map displace an already queued core resource", async () => {
+    const parent = descriptor(
+      1,
+      "https://store.example/assets/parent.js",
+      "script",
+    );
+    const sibling = descriptor(
+      2,
+      "https://store.example/assets/sibling.js",
+      "script",
+    );
+    const derived: ResourceDescriptor = {
+      resourceId: "00000000-0000-4000-8000-000000000005",
+      url: "https://store.example/assets/parent.js.map",
+      originRelation: "same-origin",
+      kind: "source-map",
+      queryPolicy: "none",
+      sources: ["source-map-reference"],
+      derivedFromResourceId: parent.resourceId,
+      fetchStatus: "pending",
+    };
+    const requested: string[] = [];
+    const resources = [parent, sibling];
+
+    const result = await collectFrontendIntelligence(
+      resources,
+      async (resourceId) => {
+        requested.push(resourceId);
+        const current = resources.find(
+          (resource) => resource.resourceId === resourceId,
+        );
+        if (current === undefined) throw new Error("unexpected derived request");
+        const text =
+          resourceId === parent.resourceId
+            ? "const parent = true;\n//# sourceMappingURL=parent.js.map"
+            : "const sibling = true;";
+        return {
+          ok: true as const,
+          resourceId,
+          descriptor: {
+            ...current,
+            fetchStatus: "analyzed" as const,
+            contentType: "text/javascript",
+            byteLength: text.length,
+            sha256: "f".repeat(64),
+          },
+          text,
+          ...(resourceId === parent.resourceId
+            ? { derivedResources: [derived] }
+            : {}),
+        };
+      },
+      { concurrency: 1, maximumBodies: 2 },
+    );
+
+    expect(requested).toEqual([parent.resourceId, sibling.resourceId]);
+    expect(result.status).toBe("completed");
+    expect(result.resources).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          resourceId: sibling.resourceId,
+          fetchStatus: "analyzed",
+        }),
+        expect.objectContaining({
+          resourceId: derived.resourceId,
+          fetchStatus: "skipped",
+          failureReason: "budget_exceeded",
+        }),
+      ]),
+    );
+  });
+
+  it("still marks a failed public script as a core frontend failure", async () => {
+    const script = descriptor(1, "https://store.example/assets/theme.js", "script");
+    const result = await collectFrontendIntelligence([script], async (resourceId) => ({
+      ok: false as const,
+      resourceId,
+      reason: "http_error" as const,
+      status: 503,
+      descriptor: {
+        ...script,
+        fetchStatus: "failed" as const,
+        failureReason: "http_error" as const,
+        httpStatus: 503,
+      },
+    }));
+
+    expect(result.status).toBe("failed");
+    expect(result.errors).toEqual([`${script.resourceId}: http_error`]);
+  });
+
   it("does not skip a map derived after another concurrent worker drains the queue", async () => {
     const fast = descriptor(
       1,

@@ -9,6 +9,7 @@ import {
   type ResourceFetchResult,
   type ResourceKind,
   type ResourceQueryPolicy,
+  type ResourceReplayPolicy,
 } from "./resource-types";
 
 export const MAX_RESOURCE_CANDIDATES = 300;
@@ -23,6 +24,12 @@ const RESOURCE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-
 const CACHE_QUERY_KEYS = new Set(["v", "ver", "version"]);
 const CACHE_QUERY_VALUE_PATTERN = /^[a-zA-Z0-9._~-]{1,64}$/u;
 const RESOURCE_KIND_SET = new Set<string>(RESOURCE_KINDS);
+const RUNTIME_REQUEST_INITIATORS = new Set([
+  "beacon",
+  "fetch",
+  "ping",
+  "xmlhttprequest",
+]);
 
 export type ResourcePolicyContext = Readonly<{ origin: string }>;
 export type RegisterResourceOptions = Readonly<{
@@ -67,7 +74,9 @@ export function registerResourceCandidates(
     }
     const originRelation =
       inspected.url.origin === origin ? "same-origin" : "cross-origin";
+    const replayPolicy = replayPolicyForCandidate(candidate);
     const canFetch =
+      replayPolicy === "safe-get" &&
       originRelation === "same-origin" &&
       inspected.queryPolicy !== "redacted" &&
       FETCHABLE_RESOURCE_KINDS.has(inspected.kind) &&
@@ -79,6 +88,7 @@ export function registerResourceCandidates(
       originRelation,
       kind: inspected.kind,
       queryPolicy: inspected.queryPolicy,
+      replayPolicy,
       sources: [...new Set(candidate.sources)].slice(0, 2),
       ...(candidate.initiator === undefined
         ? {}
@@ -150,6 +160,7 @@ export function deriveSourceMapCapability(
     originRelation: "same-origin",
     kind: "source-map",
     queryPolicy: mapUrl.searchParams.size === 0 ? "none" : "cache-key",
+    replayPolicy: "safe-get",
     sources: ["source-map-reference"],
     derivedFromResourceId: parent.resourceId,
     fetchStatus: "pending",
@@ -167,7 +178,8 @@ export async function executeRegisteredResourceRequest(
   }
   if (
     descriptor.originRelation !== "same-origin" ||
-    descriptor.fetchStatus === "metadata-only"
+    descriptor.fetchStatus === "metadata-only" ||
+    descriptor.replayPolicy === "observed-only"
   ) {
     return failure(descriptor.resourceId, "metadata_only", descriptor);
   }
@@ -284,6 +296,9 @@ export function isResourceDescriptor(value: unknown): value is ResourceDescripto
     (value.originRelation !== "same-origin" &&
       value.originRelation !== "cross-origin") ||
     !["none", "cache-key", "redacted"].includes(String(value.queryPolicy)) ||
+    (value.replayPolicy !== undefined &&
+      value.replayPolicy !== "safe-get" &&
+      value.replayPolicy !== "observed-only") ||
     !["pending", "analyzed", "metadata-only", "skipped", "failed"].includes(
       String(value.fetchStatus),
     ) ||
@@ -330,10 +345,21 @@ export function isResourceDescriptor(value: unknown): value is ResourceDescripto
     optionalMetric(value.durationMs) &&
     optionalShortString(value.contentType, 256) &&
     optionalMetric(value.byteLength) &&
+    optionalHttpStatus(value.httpStatus) &&
     (value.sha256 === undefined ||
       (typeof value.sha256 === "string" && /^[0-9a-f]{64}$/u.test(value.sha256))) &&
     (value.failureReason === undefined || typeof value.failureReason === "string")
   );
+}
+
+function replayPolicyForCandidate(
+  candidate: CollectorResourceCandidate,
+): ResourceReplayPolicy {
+  if (candidate.sources.includes("dom")) return "safe-get";
+  const initiator = candidate.initiator?.trim().toLowerCase();
+  return initiator !== undefined && RUNTIME_REQUEST_INITIATORS.has(initiator)
+    ? "observed-only"
+    : "safe-get";
 }
 
 function inspectCandidate(candidate: CollectorResourceCandidate):
@@ -526,6 +552,7 @@ function failure(
                   ? "skipped"
                   : "failed",
             failureReason: reason,
+            ...(validHttpStatus(status) ? { httpStatus: status } : {}),
           },
         }),
     ...(status === undefined ? {} : { status }),
@@ -555,6 +582,19 @@ function validMetric(value: unknown): value is number {
 
 function optionalMetric(value: unknown): boolean {
   return value === undefined || validMetric(value);
+}
+
+function optionalHttpStatus(value: unknown): boolean {
+  return value === undefined || validHttpStatus(value);
+}
+
+function validHttpStatus(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 100 &&
+    value <= 599
+  );
 }
 
 function optionalShortString(value: unknown, maximumLength: number): boolean {

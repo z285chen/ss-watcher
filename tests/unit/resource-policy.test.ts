@@ -56,6 +56,36 @@ describe("ResourcePolicy registration", () => {
       }),
     ).toHaveLength(1);
   });
+
+  it("keeps method-unknown runtime requests observed-only", () => {
+    const [runtimeRequest, domResource] = registerResourceCandidates(
+      [
+        {
+          url: "https://store.example/api/collect.json",
+          kind: "json",
+          queryPolicy: "none",
+          sources: ["resource-timing"],
+          initiator: "fetch",
+        },
+        candidate("https://store.example/assets/catalog.json", "json"),
+      ],
+      context,
+      { createResourceId: idFactory() },
+    );
+
+    expect(runtimeRequest).toMatchObject({
+      kind: "json",
+      replayPolicy: "observed-only",
+      fetchStatus: "metadata-only",
+      sources: ["resource-timing"],
+      initiator: "fetch",
+    });
+    expect(domResource).toMatchObject({
+      replayPolicy: "safe-get",
+      fetchStatus: "pending",
+      sources: ["dom"],
+    });
+  });
 });
 
 describe("ResourcePolicy execution", () => {
@@ -112,6 +142,29 @@ describe("ResourcePolicy execution", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it("never replays an observed-only runtime capability even if its stored status is pending", async () => {
+    const registeredRuntime = registered({
+      url: "https://store.example/api/collect.json",
+      kind: "json",
+      queryPolicy: "none",
+      sources: ["resource-timing"],
+      initiator: "xmlhttprequest",
+    });
+    const descriptor = {
+      ...registeredRuntime,
+      fetchStatus: "pending" as const,
+    };
+    const fetchImpl = vi.fn();
+
+    const result = await executeRegisteredResourceRequest(context, descriptor, {
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+
+    expect(descriptor.replayPolicy).toBe("observed-only");
+    expect(result).toMatchObject({ ok: false, reason: "metadata_only" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it("rejects MIME before exposing a body", async () => {
     const descriptor = registered(
       candidate("https://store.example/theme.js", "script"),
@@ -121,6 +174,28 @@ describe("ResourcePolicy execution", () => {
         responseWithUrl("PNG", descriptor.url, "image/png"),
     });
     expect(result).toMatchObject({ ok: false, reason: "mime_rejected" });
+  });
+
+  it("retains a public non-success HTTP status without exposing a body", async () => {
+    const descriptor = registered(
+      candidate("https://store.example/assets/theme.js.map", "source-map"),
+    );
+    const result = await executeRegisteredResourceRequest(context, descriptor, {
+      fetchImpl: async () =>
+        responseWithUrl("not found", descriptor.url, "text/plain", {}, 404),
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      resourceId: descriptor.resourceId,
+      reason: "http_error",
+      status: 404,
+      descriptor: {
+        fetchStatus: "failed",
+        failureReason: "http_error",
+        httpStatus: 404,
+      },
+    });
   });
 
   it("stops at the declared and streamed single-file limits", async () => {
@@ -201,6 +276,7 @@ describe("derived source-map capabilities", () => {
       originRelation: "same-origin",
       kind: "source-map",
       queryPolicy: "cache-key",
+      replayPolicy: "safe-get",
       sources: ["source-map-reference"],
       derivedFromResourceId: parent.resourceId,
       fetchStatus: "pending",
@@ -251,8 +327,10 @@ function responseWithUrl(
   url: string,
   contentType: string,
   headers: Record<string, string> = {},
+  status = 200,
 ): Response {
   const response = new Response(body, {
+    status,
     headers: { "Content-Type": contentType, ...headers },
   });
   Object.defineProperty(response, "url", { value: url });

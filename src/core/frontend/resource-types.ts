@@ -23,6 +23,7 @@ export type ResourceCapabilitySource =
   | ResourceCandidateSource
   | "source-map-reference";
 export type ResourceQueryPolicy = "none" | "cache-key" | "redacted";
+export type ResourceReplayPolicy = "safe-get" | "observed-only";
 
 /** Bounded, sanitized signal returned by the ISOLATED Collector. */
 export type CollectorResourceCandidate = Readonly<{
@@ -42,6 +43,12 @@ export type ResourceDescriptor = Readonly<{
   originRelation: ResourceOriginRelation;
   kind: ResourceKind;
   queryPolicy: ResourceQueryPolicy;
+  /**
+   * Whether ResourcePolicy may issue its fixed anonymous GET. Runtime
+   * fetch/XHR observations do not expose the original method or body and are
+   * therefore retained as evidence only.
+   */
+  replayPolicy?: ResourceReplayPolicy;
   sources: ResourceCapabilitySource[];
   /** Present only for a SW-derived source-map capability. */
   derivedFromResourceId?: string;
@@ -53,6 +60,12 @@ export type ResourceDescriptor = Readonly<{
   byteLength?: number;
   sha256?: string;
   failureReason?: ResourceFetchFailureReason;
+  /**
+   * Retained only for a non-successful public HTTP response. This makes a
+   * resource-level availability decision inspectable without storing headers
+   * or a response body.
+   */
+  httpStatus?: number;
 }>;
 
 export type ResourceFetchFailureReason =

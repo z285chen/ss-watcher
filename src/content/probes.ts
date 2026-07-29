@@ -436,7 +436,10 @@ export function collectorProbe(input: {
         return "iframe";
       case "fetch":
       case "xmlhttprequest":
-        return resourceKindFromUrl(rawUrl, "json");
+        // Resource Timing does not expose the original request method or body.
+        // Preserve an explicit file extension when present, but do not invent a
+        // JSON response type for extensionless runtime endpoints.
+        return resourceKindFromUrl(rawUrl, "other");
       default:
         return resourceKindFromUrl(rawUrl, "other");
     }

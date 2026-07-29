@@ -11,15 +11,11 @@ import {
   routeRootFromShopifyProbe,
   type CollectorSocialPlatform,
 } from "../content/probes";
-import {
-  productFacets,
-  queryProducts,
-  type ProductAvailabilityFilter,
-  type ProductSortField,
-} from "../core/analysis/product-view";
 import type { StorefrontAnalysisResult } from "../core/analysis/storefront-analysis";
 import {
   collectFrontendIntelligence,
+  MAX_FRONTEND_RESOURCE_BODIES,
+  MAX_FRONTEND_TOTAL_BYTES,
   type FrontendFinding,
   type FrontendFindingCategory,
   type FrontendIntelligenceResult,
@@ -45,7 +41,26 @@ import type { StorefrontScanContext } from "../core/shopify/storefront-scanner";
 import { runIndexedDbSmoke } from "./indexeddb-smoke";
 import { createCommittedBundleState } from "./committed-bundle-state";
 import { shouldRetryActionAuthorization } from "./action-authorization-policy";
+import PanelDiagnostics from "./PanelDiagnostics.vue";
+import PanelEmptyState from "./PanelEmptyState.vue";
+import PanelHeader from "./PanelHeader.vue";
+import PanelNavigation from "./PanelNavigation.vue";
+import PanelOverview from "./PanelOverview.vue";
+import PanelProductDrawer from "./PanelProductDrawer.vue";
+import PanelProducts from "./PanelProducts.vue";
+import PanelScanning from "./PanelScanning.vue";
+import PanelTechnology from "./PanelTechnology.vue";
 import UiIcon from "./UiIcon.vue";
+import type {
+  PanelFinding,
+  PanelFindingKind,
+  PanelProduct,
+  PanelResource,
+  PanelState,
+  PanelStore,
+  PanelTechnologySummary,
+  PanelView,
+} from "./panel-view-model";
 
 import type {
   CatalogProgress,
@@ -95,41 +110,16 @@ const sourceExportController = ref<AbortController>();
 const activeSourceExportId = ref<string>();
 const sourceExportProgress = ref("");
 const activeView = ref<ViewName>("overview");
+const selectedProduct = ref<PanelProduct>();
+const toolsOpen = ref(false);
 // Committed snapshots are immutable, atomically replaced values. Keeping the
 // bundle shallow prevents Vue from proxying IndexedDB records: structuredClone
 // (used by the product view and export path) rejects reactive Proxy objects.
 const currentBundle = createCommittedBundleState();
-const search = ref("");
-const vendorFilter = ref("");
-const productTypeFilter = ref("");
-const tagFilter = ref("");
-const availabilityFilter = ref<ProductAvailabilityFilter>("all");
-const productSort = ref<ProductSortField>("createdAt");
-const sortDirection = ref<"asc" | "desc">("desc");
-const productPage = ref(1);
-const productPageSize = 20;
 const panelInstanceId = crypto.randomUUID();
 const stagingStore = new StagingStore();
 
 const products = computed(() => catalogProducts(currentBundle.value));
-const facets = computed(() => productFacets(products.value));
-const productResult = computed(() =>
-  queryProducts(products.value, {
-    search: search.value,
-    vendors: vendorFilter.value === "" ? [] : [vendorFilter.value],
-    productTypes:
-      productTypeFilter.value === "" ? [] : [productTypeFilter.value],
-    tags: tagFilter.value === "" ? [] : [tagFilter.value],
-    availability: availabilityFilter.value,
-    sortBy: productSort.value,
-    sortDirection: sortDirection.value,
-    offset: (productPage.value - 1) * productPageSize,
-    limit: productPageSize,
-  }),
-);
-const productPageCount = computed(() =>
-  Math.max(1, Math.ceil(productResult.value.total / productPageSize)),
-);
 const analysis = computed(() => analysisFromBundle(currentBundle.value));
 const context = computed(() => contextFromBundle(currentBundle.value));
 const coverage = computed(() => coverageFromBundle(currentBundle.value));
@@ -148,32 +138,62 @@ const frontend = computed(() => frontendFromBundle(currentBundle.value));
 const frontendResources = computed(() => frontend.value?.resources ?? []);
 const visibleFrontendResources = computed(() => {
   const all = frontendResources.value;
-  const prioritized = all.filter(
+  const degradedCore = all.filter(
+    (resource) =>
+      resource.kind !== "source-map" &&
+      (resource.fetchStatus === "failed" || resource.fetchStatus === "skipped"),
+  );
+  const sourceMaps = all.filter(
     (resource) =>
       resource.kind === "source-map" ||
       resource.derivedFromResourceId !== undefined,
   );
   const prioritizedIds = new Set(
-    prioritized.map((resource) => resource.resourceId),
+    [...degradedCore, ...sourceMaps].map((resource) => resource.resourceId),
   );
   return [
-    ...prioritized,
+    ...degradedCore,
+    ...sourceMaps,
     ...all.filter((resource) => !prioritizedIds.has(resource.resourceId)),
   ].slice(0, 100);
 });
 const frontendDegradation = computed(() => {
-  const summary = frontend.value?.summary;
-  if (summary === undefined) return undefined;
-  const failed = summary.failedResources ?? 0;
-  const skipped = summary.skippedResources ?? 0;
-  if (failed + skipped === 0) return undefined;
-  const reasons = Object.entries(summary.failureReasons ?? {})
-    .filter((entry): entry is [string, number] => typeof entry[1] === "number")
-    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
-    .map(([reason, count]) => `${reason} ${count}`)
+  const degraded = (frontend.value?.resources ?? []).filter(
+    (resource) =>
+      resource.kind !== "source-map" &&
+      (resource.fetchStatus === "failed" ||
+        (resource.fetchStatus === "skipped" &&
+          resource.failureReason !== "budget_exceeded")),
+  );
+  if (degraded.length === 0) return undefined;
+  const failed = degraded.filter((resource) => resource.fetchStatus === "failed").length;
+  const skipped = degraded.length - failed;
+  const reasons = failureReasonEntries(degraded)
+    .map(({ reason, count }) => `${reason} ${count}`)
     .join(" · ");
-  return `资源级降级：失败 ${failed}，跳过 ${skipped}${reasons.length === 0 ? "" : `；${reasons}`}`;
+  return `核心资源不可用：失败 ${failed}，其他跳过 ${skipped}${reasons.length === 0 ? "" : `；${reasons}`}`;
 });
+const frontendCoverageLimit = computed(() => {
+  const limited = (frontend.value?.resources ?? []).filter(
+    (resource) =>
+      resource.kind !== "source-map" &&
+      resource.fetchStatus === "skipped" &&
+      resource.failureReason === "budget_exceeded",
+  );
+  if (limited.length === 0) return undefined;
+  return `前端分析达到安全预算：${limited.length} 个核心资源仅保留描述符`;
+});
+const frontendResourceErrorIds = computed(
+  () =>
+    new Set(
+      (frontend.value?.resources ?? [])
+        .filter(
+          (resource) =>
+            (resource.fetchStatus === "failed" || resource.fetchStatus === "skipped"),
+        )
+        .map((resource) => resource.resourceId),
+    ),
+);
 const sourceBundleCandidates = computed(() => {
   const bundle = currentBundle.value;
   if (bundle === undefined) return [];
@@ -182,33 +202,423 @@ const sourceBundleCandidates = computed(() => {
     bundle.snapshot.storeKey,
   );
 });
-const sourceBundleEstimatedBytes = computed(() =>
-  sourceBundleCandidates.value.reduce(
-    (total, resource) => total + (resource.byteLength ?? 0),
-    0,
-  ),
-);
 
-watch(
-  [
-    search,
-    vendorFilter,
-    productTypeFilter,
-    tagFilter,
-    availabilityFilter,
-    productSort,
-    sortDirection,
-  ],
-  () => {
-    productPage.value = 1;
+const activePanelView = computed<PanelView>({
+  get: () =>
+    activeView.value === "diagnostics" ? "overview" : activeView.value,
+  set: (view) => {
+    activeView.value = view;
   },
+});
+const hasSnapshot = computed(() => currentBundle.value !== undefined);
+const scanActive = computed(() => activeScanId.value !== undefined);
+const partialMessage = computed(() => buildPartialMessage());
+const panelState = computed<PanelState>(() => {
+  if (scanActive.value) return "scanning";
+  if (!hasSnapshot.value) return handle.value === undefined ? "unauthorized" : "empty";
+  if (handle.value === undefined) return "readonly";
+  return partialMessage.value === undefined ? "ready" : "partial";
+});
+const panelFindings = computed<PanelFinding[]>(() =>
+  (frontend.value?.findings ?? []).map(toPanelFinding),
 );
+const panelResources = computed<PanelResource[]>(() =>
+  visibleFrontendResources.value.map(toPanelResource),
+);
+const panelTechnologySummary = computed<PanelTechnologySummary | undefined>(
+  () => toPanelTechnologySummary(frontend.value),
+);
+const panelProducts = computed<PanelProduct[]>(() =>
+  products.value.map(toPanelProduct),
+);
+const panelStore = computed<PanelStore>(() => toPanelStore());
 
 watch(activeView, () => {
+  selectedProduct.value = undefined;
+  toolsOpen.value = false;
   globalThis.requestAnimationFrame(() => {
     globalThis.scrollTo({ top: 0, behavior: "auto" });
   });
 });
+
+function buildPartialMessage(): string | undefined {
+  const bundle = currentBundle.value;
+  if (bundle === undefined) return undefined;
+  const messages: string[] = [];
+  if (bundle.snapshot.scanStatus === "blocked") {
+    messages.push("扫描遇到密码、挑战或安全拒绝，已保留可用结果");
+  } else if (bundle.snapshot.scanStatus === "partial") {
+    messages.push("产品或上下文扫描为部分覆盖");
+  }
+  if (
+    analysis.value?.status === "partial" ||
+    analysis.value?.status === "blocked"
+  ) {
+    messages.push(`分析状态为 ${analysis.value.status}`);
+  }
+  if (coverage.value?.truncated === true) {
+    messages.push("公开产品目录达到上限，结果已截断");
+  }
+  if (frontendDegradation.value !== undefined) {
+    messages.push(frontendDegradation.value);
+  } else if (
+    frontend.value?.status === "failed" &&
+    frontend.value.errors.some(
+      (error) => !isFrontendResourceError(error, frontendResourceErrorIds.value),
+    )
+  ) {
+    messages.push("公开前端分析失败，资源描述符仍保留");
+  }
+  if (frontendCoverageLimit.value !== undefined) {
+    messages.push(frontendCoverageLimit.value);
+  }
+  const snapshotErrors = bundle.snapshot.errors;
+  const criticalSnapshotErrors = Array.isArray(snapshotErrors)
+    ? snapshotErrors.filter(
+        (error) =>
+          !isFrontendResourceError(error, frontendResourceErrorIds.value),
+      )
+    : [];
+  if (criticalSnapshotErrors.length > 0) {
+    messages.push(`快照记录 ${criticalSnapshotErrors.length} 条模块错误`);
+  }
+  const unique = [...new Set(messages)];
+  return unique.length === 0 ? undefined : unique.join("；");
+}
+
+function toPanelStore(): PanelStore {
+  const productCount = analysis.value?.statistics.productCount ?? products.value.length;
+  const variantCount =
+    analysis.value?.statistics.variantCount ??
+    products.value.reduce((total, product) => total + product.variants.length, 0);
+  const discountedProducts =
+    analysis.value?.statistics.discount.discountedProducts ?? 0;
+  const technologyCount = frontend.value?.findings.length ?? 0;
+  const pixelCount =
+    frontend.value?.findings.filter((finding) => finding.category === "pixel")
+      .length ?? 0;
+  const sourceMapCount = frontendResources.value.filter(
+    (resource) => resource.kind === "source-map",
+  ).length;
+  const sources = coverage.value?.sources ?? [];
+  const sourceLabel = sources.length === 0 ? "未记录目录来源" : sources.join(" + ");
+  const marketParts = [context.value?.country, context.value?.currency].filter(
+    (value): value is string => value !== undefined && value.length > 0,
+  );
+  const priceVerified = context.value?.priceContextVerified === true;
+  const scanStatus = currentBundle.value?.snapshot.scanStatus;
+  const summaryTitle =
+    scanStatus === "not-shopify"
+      ? "当前公开信号未达到 Shopify 识别阈值"
+      : partialMessage.value !== undefined
+        ? "公开目录已提交，部分模块存在明确降级"
+        : priceVerified
+          ? "公开目录、价格口径与主题信号均可核查"
+          : "公开目录与主题信号可核查，价格仍待验证";
+  const partial = partialMessage.value;
+  const favicon = storeProfile.value?.favicon;
+
+  return {
+    host: storeHost.value,
+    initial: storeInitial.value,
+    snapshotLabel:
+      currentBundle.value === undefined
+        ? "尚无 committed 快照"
+        : `上次扫描 ${snapshotTime.value}${handle.value === undefined ? " · 只读" : ""}`,
+    theme: themeLabel.value,
+    market: marketParts.length === 0 ? "市场未知" : marketParts.join(" · "),
+    storefront: context.value?.storefrontKind ?? "类型未知",
+    priceVerified,
+    readOnly: handle.value === undefined,
+    productCount,
+    variantCount,
+    discountedProducts,
+    technologyCount,
+    pixelCount,
+    sourceMapCount,
+    coverageLabel: `${coverage.value?.productsFetched ?? productCount} 个公开产品 · ${sourceLabel}`,
+    sourceLabel,
+    summaryTitle,
+    summaryBody:
+      "先从公开产品结构判断品类，再用可回溯证据核查前端栈；公开排序不是销量，Pixel 代码信号也不是流量证明。",
+    socials: socialLinks.value.map((social) => ({
+      platform: social.platform,
+      label: socialLabel(social.platform),
+      url: social.url,
+    })),
+    ...(favicon === undefined ? {} : { favicon }),
+    ...(partial === undefined ? {} : { partialMessage: partial }),
+  };
+}
+
+function toPanelProduct(product: CatalogProduct, index: number): PanelProduct {
+  const key = product.id ?? product.handle ?? `product-${index}`;
+  const publicUrl = productUrl(product);
+  const image = productImage(product);
+  const verified = context.value?.priceContextVerified === true;
+  const variants = product.variants.map((variant, variantIndex) => {
+    const sku = variant.sku?.trim();
+    return {
+      key: variant.id || `${key}-variant-${variantIndex}`,
+      title: variant.title?.trim() || `变体 ${variantIndex + 1}`,
+      price: displayVariantPrice(variant),
+      availability:
+        variant.available === true
+          ? "有货" as const
+          : variant.available === false
+            ? "售罄" as const
+            : "未知" as const,
+      ...(sku === undefined || sku.length === 0 ? {} : { sku }),
+    };
+  });
+  const firstVerifiedPrice = variants.find((variant) => variant.price !== "—")?.price;
+  return {
+    key,
+    title: product.title?.trim() || product.handle || "未命名产品",
+    handle: product.handle ?? "无 handle",
+    vendor: product.vendor?.trim() || "未提供",
+    type: product.productType?.trim() || "未提供",
+    tags: product.tags,
+    createdAt: displayDate(product.createdAt),
+    createdAtEpoch:
+      product.createdAt !== undefined && Number.isFinite(Date.parse(product.createdAt))
+        ? Date.parse(product.createdAt)
+        : 0,
+    price: firstVerifiedPrice ?? "—",
+    priceNote: verified
+      ? firstVerifiedPrice === undefined
+        ? "公开变体未提供可验证价格"
+        : "首个已验证公开变体"
+      : "价格上下文未通过门控",
+    availability: productAvailabilityLabel(product),
+    sourceLabel:
+      product.sources.length === 0 ? "未记录" : product.sources.join(" + "),
+    variants,
+    ...(image === undefined ? {} : { image }),
+    ...(publicUrl === undefined ? {} : { url: publicUrl }),
+  };
+}
+
+function displayVariantPrice(
+  variant: CatalogProduct["variants"][number],
+): string {
+  const scanContext = context.value;
+  if (
+    scanContext?.priceContextVerified !== true ||
+    variant.price === undefined ||
+    variant.priceSource === undefined ||
+    scanContext.priceSourceStatus[variant.priceSource] !== "verified"
+  ) {
+    return "—";
+  }
+  if (variant.priceSource === "product-ajax-js") {
+    return displayMinor(String(variant.price));
+  }
+  const numeric = Number(variant.price);
+  const currency = scanContext.currency;
+  if (!Number.isFinite(numeric) || currency === undefined) return "—";
+  try {
+    return new Intl.NumberFormat("zh-CN", {
+      style: "currency",
+      currency,
+      currencyDisplay: "code",
+    }).format(numeric);
+  } catch {
+    return `${currency} ${numeric}`;
+  }
+}
+
+function toPanelFinding(finding: FrontendFinding): PanelFinding {
+  const kind = panelFindingKind(finding.category);
+  return {
+    id: finding.findingId,
+    kind,
+    label: finding.label,
+    confidence: `${Math.round(Math.max(0, Math.min(1, finding.confidence)) * 100)}%`,
+    maturity: finding.maturity,
+    summary: findingSummary(finding),
+    evidence: finding.evidence.slice(0, 8).map((evidence) => {
+      const resource = frontendResources.value.find(
+        (candidate) => candidate.resourceId === evidence.resourceId,
+      );
+      const source =
+        resource === undefined
+          ? evidence.resourceId.slice(0, 12)
+          : `${resourceHost(resource)}${resourcePath(resource)}`;
+      return `${source} · ${evidence.excerpt}`;
+    }),
+    tone:
+      kind === "pixel" || kind === "app"
+        ? "mint"
+        : kind === "performance"
+          ? "amber"
+          : kind === "source-map" || kind === "api"
+            ? "blue"
+            : "purple",
+  };
+}
+
+function panelFindingKind(
+  category: FrontendFindingCategory,
+): PanelFindingKind {
+  return category === "api-reference" ? "api" : category;
+}
+
+function findingSummary(finding: FrontendFinding): string {
+  switch (finding.category) {
+    case "pixel":
+      return "在当前公开代码或资源 URL 中检测到 Pixel 规则命中；这不证明实际流量、事件触发或投放效果。";
+    case "app":
+      return "在公开前端资源中检测到 App 相关规则命中；仅表示代码信号存在。";
+    case "api-reference":
+      return "公开代码出现 API 字符串或 operation 引用；不表示接口可匿名访问。";
+    case "source-map":
+      return "已验证同源 source map 证据；正文仅在受限会话中短暂分析，不写入快照。";
+    case "performance":
+      return "Resource Timing 或静态资源规则出现性能信号；不是实验室或真实用户性能评分。";
+    case "theme":
+      return "公开主题运行时或资源路径与该主题规则一致。";
+    case "framework":
+      return "公开前端资源中的框架特征达到当前规则阈值。";
+  }
+}
+
+function toPanelResource(resource: ResourceDescriptor): PanelResource {
+  return {
+    id: resource.resourceId,
+    kind: resource.kind,
+    host: resourceHost(resource),
+    path: resourcePath(resource),
+    status: resource.fetchStatus,
+    bytes: displayBytes(resource.byteLength ?? resource.transferSize),
+    relation: resource.originRelation,
+    ...(resource.replayPolicy === undefined
+      ? {}
+      : { replayPolicy: resource.replayPolicy }),
+    ...(resource.initiator === undefined
+      ? {}
+      : { initiator: resource.initiator }),
+    ...(resource.failureReason === undefined
+      ? {}
+      : { failureReason: resource.failureReason }),
+    ...(resource.httpStatus === undefined
+      ? {}
+      : { httpStatus: resource.httpStatus }),
+    ...(resource.derivedFromResourceId === undefined
+      ? {}
+      : { derivedFrom: resource.derivedFromResourceId }),
+  };
+}
+
+function toPanelTechnologySummary(
+  result: FrontendIntelligenceResult | undefined,
+): PanelTechnologySummary | undefined {
+  if (result === undefined) return undefined;
+  const unavailable = result.resources.filter(
+    (resource) =>
+      resource.fetchStatus === "failed" || resource.fetchStatus === "skipped",
+  );
+  const coreUnavailable = unavailable.filter(
+    (resource) => resource.kind !== "source-map",
+  );
+  const sourceMapUnavailable = unavailable.filter(
+    (resource) => resource.kind === "source-map",
+  );
+  const coreFailed = coreUnavailable.filter(
+    (resource) => resource.fetchStatus === "failed",
+  );
+  const coreBudgetLimited = coreUnavailable.filter(
+    (resource) =>
+      resource.fetchStatus === "skipped" &&
+      resource.failureReason === "budget_exceeded",
+  );
+  const coreOtherSkipped = coreUnavailable.filter(
+    (resource) =>
+      resource.fetchStatus === "skipped" &&
+      resource.failureReason !== "budget_exceeded",
+  );
+  const coreDegraded = [...coreFailed, ...coreOtherSkipped];
+  return {
+    totalResources: result.summary.totalResources,
+    sameOriginResources: result.summary.sameOriginResources,
+    analyzedResources: result.summary.analyzedResources,
+    metadataOnlyResources: result.summary.metadataOnlyResources,
+    failedResources: result.summary.failedResources,
+    skippedResources: result.summary.skippedResources,
+    analyzedBytes: displayBytes(result.summary.analyzedBytes),
+    failureReasons: failureReasonEntries(unavailable),
+    resourceBodyLimit: MAX_FRONTEND_RESOURCE_BODIES,
+    resourceByteLimit: displayBytes(MAX_FRONTEND_TOTAL_BYTES),
+    coreFailedResources: coreFailed.length,
+    coreSkippedResources: coreOtherSkipped.length,
+    coreBudgetLimitedResources: coreBudgetLimited.length,
+    coreFailureReasons: failureReasonEntries(coreDegraded),
+    sourceMapUnavailableResources: sourceMapUnavailable.length,
+    sourceMapFailureReasons: failureReasonEntries(sourceMapUnavailable),
+  };
+}
+
+function failureReasonEntries(
+  resources: readonly ResourceDescriptor[],
+): readonly Readonly<{ reason: string; count: number }>[] {
+  const counts = new Map<string, number>();
+  for (const resource of resources) {
+    if (resource.failureReason === undefined) continue;
+    counts.set(
+      resource.failureReason,
+      (counts.get(resource.failureReason) ?? 0) + 1,
+    );
+  }
+  return [...counts.entries()]
+    .map(([reason, count]) => ({ reason, count }))
+    .sort((left, right) => right.count - left.count || left.reason.localeCompare(right.reason));
+}
+
+function isFrontendResourceError(
+  error: string,
+  resourceErrorIds: ReadonlySet<string>,
+): boolean {
+  if (!error.startsWith("frontend: ")) return false;
+  const resourceError = error.slice("frontend: ".length);
+  return [...resourceErrorIds].some((resourceId) =>
+    resourceError.startsWith(`${resourceId}:`),
+  );
+}
+
+function handlePrimaryAction(): void {
+  toolsOpen.value = false;
+  if (handle.value === undefined) {
+    void establish();
+    return;
+  }
+  void scanM3();
+}
+
+function openDiagnostics(): void {
+  toolsOpen.value = false;
+  selectedProduct.value = undefined;
+  activeView.value = "diagnostics";
+}
+
+function handleExportCsv(): void {
+  toolsOpen.value = false;
+  exportCsv();
+}
+
+function handleExportJson(): void {
+  toolsOpen.value = false;
+  exportJson();
+}
+
+function handleExportSources(): void {
+  toolsOpen.value = false;
+  void exportPublicSources();
+}
+
+function handleRevoke(): void {
+  toolsOpen.value = false;
+  void revoke();
+}
 
 function isActionAuthorizedNotice(
   value: unknown,
@@ -341,6 +751,8 @@ async function scanM3(): Promise<void> {
   }
 
   busy.value = true;
+  selectedProduct.value = undefined;
+  toolsOpen.value = false;
   const controller = new AbortController();
   const scanId = crypto.randomUUID();
   scanController.value = controller;
@@ -890,14 +1302,6 @@ function frontendFromBundle(
     : undefined;
 }
 
-function technologyFindings(
-  categories: readonly FrontendFindingCategory[],
-): FrontendFinding[] {
-  return (frontend.value?.findings ?? []).filter((finding) =>
-    categories.includes(finding.category),
-  );
-}
-
 function resourceHost(resource: ResourceDescriptor): string {
   try {
     return new URL(resource.url).hostname;
@@ -1051,11 +1455,6 @@ function socialLabel(platform: CollectorSocialPlatform): string {
   return labels[platform];
 }
 
-function hideBrokenImage(event: Event): void {
-  const target = event.currentTarget;
-  if (target instanceof HTMLImageElement) target.hidden = true;
-}
-
 function productUrl(product: CatalogProduct): string | undefined {
   if (product.canonicalUrl !== undefined) return product.canonicalUrl;
   return product.handle === undefined || sessionOrigin.value === ""
@@ -1105,34 +1504,8 @@ function displayStoreHost(value: string): string {
   }
 }
 
-function productInitial(product: CatalogProduct): string {
-  return (product.title ?? product.handle ?? product.id ?? "P")[0]?.toUpperCase() ?? "P";
-}
-
 function productImage(product: CatalogProduct | undefined): string | undefined {
   return product?.images.find((image) => image.trim().length > 0);
-}
-
-function productImageForReference(
-  reference: Readonly<{ id?: string; handle?: string }>,
-): string | undefined {
-  const product = products.value.find(
-    (candidate) =>
-      (reference.handle !== undefined && candidate.handle === reference.handle) ||
-      (reference.id !== undefined && candidate.id === reference.id),
-  );
-  return productImage(product);
-}
-
-function productInitialForReference(
-  reference: Readonly<{ id?: string; handle?: string; title?: string }>,
-): string {
-  return (
-    reference.title ??
-    reference.handle ??
-    reference.id ??
-    "P"
-  )[0]?.toUpperCase() ?? "P";
 }
 
 function productAvailabilityState(
@@ -1157,11 +1530,6 @@ function productAvailabilityLabel(product: CatalogProduct): string {
     : availability === "unavailable"
       ? "售罄"
       : "未知";
-}
-
-function distributionWidth(count: number, maximum: number | undefined): string {
-  if (maximum === undefined || maximum < 1) return "0%";
-  return `${Math.max(6, Math.round((count / maximum) * 100))}%`;
 }
 
 function displayMinor(value: string | undefined): string {
@@ -1205,745 +1573,104 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="app-shell">
-    <header class="topbar">
-      <div class="brand-lockup">
-        <span class="brand-mark">
-          <img src="/icons/ss-watcher-48.png" alt="" />
-        </span>
-        <div>
-          <strong>SS Watcher</strong>
-          <small>STOREFRONT SIGNALS · M3</small>
-        </div>
-      </div>
+  <main class="prototype-shell">
+    <PanelHeader
+      :state="panelState"
+      :tools-open="toolsOpen"
+      :status="hasSnapshot ? `${panelStore.host} · ${status}` : status"
+      :product-count="hasSnapshot ? panelStore.productCount : 0"
+      :can-scan="handle !== undefined && !busy && !sourceExportBusy"
+      :can-export="hasSnapshot && !busy && !sourceExportBusy"
+      :can-export-sources="hasSnapshot && handle !== undefined && sourceBundleCandidates.length > 0 && !busy"
+      :operation-busy="busy || sourceExportBusy"
+      :source-export-busy="sourceExportBusy"
+      :source-export-progress="sourceExportProgress"
+      @primary="handlePrimaryAction"
+      @cancel-scan="cancelScan"
+      @toggle-tools="toolsOpen = !toolsOpen"
+      @export-csv="handleExportCsv"
+      @export-json="handleExportJson"
+      @export-sources="handleExportSources"
+      @diagnostics="openDiagnostics"
+      @revoke="handleRevoke"
+    />
 
-      <div class="topbar-actions">
-        <button
-          v-if="currentBundle"
-          type="button"
-          class="mini-action"
-          title="导出产品 CSV"
-          aria-label="导出产品 CSV"
-          :disabled="busy || sourceExportBusy"
-          @click="exportCsv"
-        >
-          <UiIcon name="download" :size="15" />
-          <span>CSV</span>
-        </button>
-        <button
-          v-if="currentBundle"
-          type="button"
-          class="mini-action"
-          title="导出完整 JSON"
-          aria-label="导出完整 JSON"
-          :disabled="busy || sourceExportBusy"
-          @click="exportJson"
-        >
-          <UiIcon name="file" :size="15" />
-          <span>JSON</span>
-        </button>
-        <button
-          type="button"
-          class="scan-action"
-          data-testid="scan-m3"
-          :disabled="busy || sourceExportBusy || !handle"
-          @click="scanM3"
-        >
-          <UiIcon name="refresh" :size="15" />
-          <span>{{ busy ? "扫描中" : currentBundle ? "重新扫描" : "开始扫描" }}</span>
-        </button>
-        <button
-          v-if="scanController"
-          type="button"
-          class="icon-action danger"
-          data-testid="cancel-m3"
-          title="取消扫描"
-          aria-label="取消扫描"
-          @click="cancelScan"
-        >
-          <UiIcon name="cancel" :size="16" />
-        </button>
-      </div>
-    </header>
+    <PanelNavigation
+      v-if="hasSnapshot && !scanActive && activeView !== 'diagnostics'"
+      v-model="activePanelView"
+      :product-count="panelStore.productCount"
+      :finding-count="panelFindings.length"
+    />
 
-    <section
-      class="status-strip"
-      :class="{ busy: busy || sourceExportBusy, offline: !handle, ready: currentBundle && !busy && !sourceExportBusy }"
-      data-testid="session-status"
-    >
-      <span class="status-dot" aria-hidden="true" />
-      <strong>{{ status }}</strong>
-      <span v-if="coverage" class="status-count">
-        {{ coverage.productsFetched }} products
-      </span>
-    </section>
+    <PanelScanning
+      v-if="scanActive"
+      :status="status"
+      :detail="detail"
+      :product-count="products.length"
+      @cancel="cancelScan"
+    />
 
-    <section v-if="currentBundle && context" class="store-summary">
-      <div class="store-identity">
-        <span class="store-avatar">
-          {{ storeInitial }}
-          <img
-            v-if="storeProfile?.favicon"
-            :src="storeProfile.favicon"
-            alt=""
-            referrerpolicy="no-referrer"
-            @error="hideBrokenImage"
-          />
-        </span>
-        <div>
-          <strong>{{ storeHost }}</strong>
-          <small>上次扫描 {{ snapshotTime }}</small>
-          <span class="theme-detail" :title="themeLabel">
-            <UiIcon name="layers" :size="12" />
-            主题 · {{ themeLabel }}
-          </span>
-        </div>
-      </div>
-      <span
-        class="trust-badge"
-        :class="{ warning: !handle || !context.priceContextVerified }"
-      >
-        <UiIcon name="shield" :size="14" />
-        {{ !handle ? "只读快照" : context.priceContextVerified ? "价格已验证" : "价格待验证" }}
-      </span>
-      <div class="context-summary">
-        <span class="context-market">
-          市场 · {{ context.country ?? "未知" }} · {{ context.currency ?? "未知" }}
-        </span>
-        <span v-if="coverage?.truncated" class="context-warning">结果已截断</span>
-      </div>
-      <div class="social-list">
-        <span class="social-caption">社交媒体</span>
-        <template v-if="socialLinks.length > 0">
-          <a
-            v-for="social in socialLinks"
-            :key="social.platform"
-            :href="social.url"
-            target="_blank"
-            rel="noopener noreferrer"
-            :title="social.url"
-          >
-            {{ socialLabel(social.platform) }}
-          </a>
-        </template>
-        <span v-else class="social-empty">未发现公开账号</span>
-      </div>
-    </section>
+    <PanelEmptyState
+      v-else-if="!hasSnapshot"
+      :authorized="handle !== undefined"
+      :status="status"
+      :detail="detail"
+      @primary="handlePrimaryAction"
+    />
 
-    <nav v-if="currentBundle" class="app-nav" aria-label="结果页面">
-      <button
-        type="button"
-        :class="{ active: activeView === 'overview' }"
-        :aria-current="activeView === 'overview' ? 'page' : undefined"
-        @click="activeView = 'overview'"
-      >
-        <UiIcon name="overview" />
-        <span>店铺概览</span>
-      </button>
-      <button
-        type="button"
-        :class="{ active: activeView === 'products' }"
-        :aria-current="activeView === 'products' ? 'page' : undefined"
-        @click="activeView = 'products'"
-      >
-        <UiIcon name="products" />
-        <span>产品</span>
-        <b>{{ products.length }}</b>
-      </button>
-      <button
-        type="button"
-        :class="{ active: activeView === 'technology' }"
-        :aria-current="activeView === 'technology' ? 'page' : undefined"
-        @click="activeView = 'technology'"
-      >
-        <UiIcon name="code" />
-        <span>技术</span>
-        <b v-if="frontend">{{ frontend.findings.length }}</b>
-      </button>
-      <button
-        type="button"
-        :class="{ active: activeView === 'diagnostics' }"
-        :aria-current="activeView === 'diagnostics' ? 'page' : undefined"
-        @click="activeView = 'diagnostics'"
-      >
-        <UiIcon name="diagnostics" />
-        <span>诊断</span>
-      </button>
-    </nav>
+    <PanelDiagnostics
+      v-else-if="activeView === 'diagnostics'"
+      :status="status"
+      :detail="detail"
+      :boot-id="bootId"
+      :busy="busy || sourceExportBusy"
+      :has-session="handle !== undefined"
+      @back="activeView = 'overview'"
+      @establish="establish"
+      @probes="runProbes"
+      @cart="fetchCart"
+      @products="fetchProducts"
+      @storage="runStorageSmoke"
+      @revoke="revoke"
+    />
 
-    <p
-      v-if="currentBundle && context && (!context.priceContextVerified || context.contextMismatch)"
-      class="warning-banner"
-    >
-      匿名 market/currency 或价格来源尚未全部通过门控；仅展示公开原始字段，不生成价格比较结论。
-    </p>
-
-    <section v-if="!currentBundle" class="empty-state">
-      <span class="empty-illustration"><UiIcon name="radar" :size="34" /></span>
-      <div>
-        <p class="eyebrow">READY TO INSPECT</p>
-        <h1>{{ handle ? "扫描当前 Shopify 店铺" : "先授权当前店铺" }}</h1>
-        <p>
-          {{ handle
-            ? "读取公开产品目录与当前页面资源，并生成产品、技术栈和代码引用证据。"
-            : "回到公开店铺标签页点击扩展图标。面板不会自行获取新的 activeTab 授权。" }}
-        </p>
-      </div>
-      <button
-        type="button"
-        class="empty-scan-action"
-        :disabled="busy || !handle"
-        @click="scanM3"
-      >
-        <UiIcon name="refresh" :size="16" />
-        {{ handle ? "开始分析" : "等待授权" }}
-      </button>
-      <div class="privacy-row">
-        <UiIcon name="shield" :size="15" />
-        仅访问公开页面 · omit credentials · 不跟随重定向
-      </div>
-    </section>
-
-    <section
+    <PanelOverview
       v-else-if="activeView === 'overview'"
-      class="view-content overview-view"
-    >
-      <header class="view-heading">
-        <div>
-          <p class="eyebrow">STORE OVERVIEW</p>
-          <h1>店铺概览</h1>
-        </div>
-        <button type="button" class="text-action" @click="activeView = 'products'">
-          查看全部产品 <UiIcon name="chevron-right" :size="14" />
-        </button>
-      </header>
+      :store="panelStore"
+      @open-products="activeView = 'products'"
+      @open-technology="activeView = 'technology'"
+    />
 
-      <div v-if="analysis" class="metric-grid">
-        <article>
-          <span class="metric-icon purple"><UiIcon name="box" /></span>
-          <div><small>产品总数</small><strong>{{ analysis.statistics.productCount }}</strong></div>
-        </article>
-        <article>
-          <span class="metric-icon blue"><UiIcon name="layers" /></span>
-          <div><small>变体数量</small><strong>{{ analysis.statistics.variantCount }}</strong></div>
-        </article>
-        <article>
-          <span class="metric-icon amber"><UiIcon name="tag" /></span>
-          <div><small>折扣产品</small><strong>{{ analysis.statistics.discount.discountedProducts }}</strong></div>
-        </article>
-        <article class="price-metric">
-          <span class="metric-icon green"><UiIcon name="trend" /></span>
-          <div>
-            <small>价格区间</small>
-            <strong>
-              {{ displayMinor(analysis.statistics.price.minMinor) }}
-              <span>–</span>
-              {{ displayMinor(analysis.statistics.price.maxMinor) }}
-            </strong>
-          </div>
-        </article>
-      </div>
+    <PanelProducts
+      v-else-if="activeView === 'products'"
+      :products="panelProducts"
+      :store="panelStore"
+      @select="selectedProduct = $event"
+      @export-csv="exportCsv"
+    />
 
-      <div v-if="coverage" class="coverage-line">
-        <span><UiIcon name="database" :size="14" /> {{ coverage.productsFetched }} 个公开产品</span>
-        <span>来源：{{ coverage.sources.join(' + ') || '无' }}</span>
-      </div>
+    <PanelTechnology
+      v-else
+      :host="panelStore.host"
+      :findings="panelFindings"
+      :resources="panelResources"
+      :summary="panelTechnologySummary"
+      :partial-message="partialMessage"
+      :can-export-sources="handle !== undefined && sourceBundleCandidates.length > 0 && !busy"
+      :export-busy="sourceExportBusy"
+      :export-progress="sourceExportProgress"
+      @export-sources="handleExportSources"
+    />
 
-      <section v-if="analysis" class="content-card">
-        <header class="card-heading">
-          <div>
-            <span class="section-icon purple"><UiIcon name="trend" /></span>
-            <div>
-              <h2>公开畅销排序</h2>
-              <p>{{ analysis.bestSelling.scope?.handle ?? "无可用 scope" }}</p>
-            </div>
-          </div>
-          <span class="data-pill">TOP {{ Math.min(6, analysis.bestSelling.items.length) }}</span>
-        </header>
-        <p class="disclaimer">{{ analysis.bestSelling.disclaimer }}</p>
-        <ol v-if="analysis.bestSelling.items.length > 0" class="insight-list rank-list">
-          <li v-for="item in analysis.bestSelling.items.slice(0, 6)" :key="item.handle">
-            <span class="rank-number">{{ item.rank }}</span>
-            <span class="insight-thumb">
-              <img
-                v-if="productImageForReference(item)"
-                :src="productImageForReference(item)"
-                alt=""
-                crossorigin="anonymous"
-                referrerpolicy="no-referrer"
-                loading="lazy"
-              />
-              <span v-else>{{ productInitialForReference(item) }}</span>
-            </span>
-            <div>
-              <a v-if="item.canonicalUrl" :href="item.canonicalUrl" target="_blank" rel="noreferrer">
-                {{ item.title ?? item.handle }}
-              </a>
-              <strong v-else>{{ item.title ?? item.handle }}</strong>
-              <small>{{ item.handle }}</small>
-            </div>
-            <UiIcon name="chevron-right" :size="14" />
-          </li>
-        </ol>
-        <p v-else class="empty-copy">未取得可验证的公开 Collection 顺序。</p>
-      </section>
-
-      <section v-if="analysis" class="content-card">
-        <header class="card-heading">
-          <div>
-            <span class="section-icon amber"><UiIcon name="clock" /></span>
-            <div>
-              <h2>上新候选</h2>
-              <p>A–D 证据等级</p>
-            </div>
-          </div>
-          <span class="data-pill">{{ analysis.newness.status }}</span>
-        </header>
-        <p class="disclaimer">{{ analysis.newness.disclaimer }}</p>
-        <ul v-if="analysis.newness.candidates.length > 0" class="insight-list newness-list">
-          <li
-            v-for="candidate in analysis.newness.candidates.slice(0, 6)"
-            :key="candidate.id ?? candidate.handle"
-          >
-            <span class="grade">{{ candidate.primaryGrade }}</span>
-            <span class="insight-thumb">
-              <img
-                v-if="productImageForReference(candidate)"
-                :src="productImageForReference(candidate)"
-                alt=""
-                crossorigin="anonymous"
-                referrerpolicy="no-referrer"
-                loading="lazy"
-              />
-              <span v-else>{{ productInitialForReference(candidate) }}</span>
-            </span>
-            <div>
-              <strong>{{ candidate.title ?? candidate.handle ?? candidate.id }}</strong>
-              <small>
-                {{ candidate.primaryTimestamp
-                  ? displayDate(candidate.primaryTimestamp)
-                  : `公开相对排名 #${candidate.collectionRank ?? '—'}` }}
-              </small>
-            </div>
-          </li>
-        </ul>
-        <p v-else class="empty-copy">无可用上新证据。</p>
-      </section>
-
-      <section v-if="analysis" class="content-card distribution-card">
-        <header class="card-heading">
-          <div>
-            <span class="section-icon blue"><UiIcon name="layers" /></span>
-            <div><h2>商品结构</h2><p>Vendor、类型与标签分布</p></div>
-          </div>
-        </header>
-        <div class="distribution-grid">
-          <div class="distribution-column">
-            <h3>Vendor</h3>
-            <div
-              v-for="entry in analysis.statistics.vendors.slice(0, 6)"
-              :key="entry.value"
-              class="distribution-item"
-            >
-              <p><span>{{ entry.value }}</span><strong>{{ entry.count }}</strong></p>
-              <i><span :style="{ width: distributionWidth(entry.count, analysis.statistics.vendors[0]?.count) }" /></i>
-            </div>
-          </div>
-          <div class="distribution-column">
-            <h3>Product Type</h3>
-            <div
-              v-for="entry in analysis.statistics.productTypes.slice(0, 6)"
-              :key="entry.value"
-              class="distribution-item"
-            >
-              <p><span>{{ entry.value }}</span><strong>{{ entry.count }}</strong></p>
-              <i><span :style="{ width: distributionWidth(entry.count, analysis.statistics.productTypes[0]?.count) }" /></i>
-            </div>
-          </div>
-        </div>
-        <div v-if="analysis.statistics.tags.length > 0" class="tag-cloud">
-          <span v-for="entry in analysis.statistics.tags.slice(0, 12)" :key="entry.value">
-            {{ entry.value }} <b>{{ entry.count }}</b>
-          </span>
-        </div>
-      </section>
-    </section>
-
-    <section v-else-if="activeView === 'products'" class="view-content products-view">
-      <header class="view-heading">
-        <div>
-          <p class="eyebrow">PRODUCT EXPLORER</p>
-          <h1>产品目录</h1>
-        </div>
-        <span class="result-count">{{ productResult.total }} / {{ products.length }}</span>
-      </header>
-
-      <div class="search-box">
-        <UiIcon name="search" :size="17" />
-        <input v-model="search" type="search" placeholder="搜索标题、handle、SKU 或 Tag" />
-      </div>
-
-      <div class="filter-grid">
-        <select v-model="vendorFilter" aria-label="Vendor 筛选">
-          <option value="">全部 Vendor</option>
-          <option v-for="entry in facets.vendors" :key="entry.value" :value="entry.value">
-            {{ entry.value }} ({{ entry.count }})
-          </option>
-        </select>
-        <select v-model="productTypeFilter" aria-label="Product Type 筛选">
-          <option value="">全部 Product Type</option>
-          <option v-for="entry in facets.productTypes" :key="entry.value" :value="entry.value">
-            {{ entry.value }} ({{ entry.count }})
-          </option>
-        </select>
-        <select v-model="tagFilter" aria-label="Tag 筛选">
-          <option value="">全部 Tag</option>
-          <option v-for="entry in facets.tags" :key="entry.value" :value="entry.value">
-            {{ entry.value }} ({{ entry.count }})
-          </option>
-        </select>
-        <select v-model="availabilityFilter" aria-label="库存状态筛选">
-          <option value="all">全部库存状态</option>
-          <option value="available">有货</option>
-          <option value="unavailable">售罄</option>
-          <option value="unknown">未知</option>
-        </select>
-      </div>
-
-      <div class="sort-row">
-        <span><UiIcon name="sort" :size="15" /> 排序</span>
-        <select v-model="productSort" aria-label="产品排序字段">
-          <option value="createdAt">创建时间</option>
-          <option value="publishedAt">发布时间</option>
-          <option value="updatedAt">更新时间</option>
-          <option value="title">标题</option>
-          <option value="vendor">Vendor</option>
-          <option value="productType">Product Type</option>
-          <option value="variantCount">变体数</option>
-        </select>
-        <button
-          type="button"
-          class="direction-action"
-          @click="sortDirection = sortDirection === 'asc' ? 'desc' : 'asc'"
-        >
-          {{ sortDirection === "asc" ? "升序 ↑" : "降序 ↓" }}
-        </button>
-      </div>
-
-      <div v-if="productResult.rows.length > 0" class="product-list">
-        <article
-          v-for="product in productResult.rows"
-          :key="product.id ?? product.handle ?? product.canonicalUrl"
-          class="product-row"
-        >
-          <span class="product-avatar" :class="{ 'has-image': productImage(product) }">
-            <img
-              v-if="productImage(product)"
-              :src="productImage(product)"
-              alt=""
-              crossorigin="anonymous"
-              referrerpolicy="no-referrer"
-              loading="lazy"
-            />
-            <span v-else>{{ productInitial(product) }}</span>
-          </span>
-          <div class="product-copy">
-            <a
-              v-if="productUrl(product)"
-              :href="productUrl(product)"
-              target="_blank"
-              rel="noreferrer"
-            >
-              {{ product.title ?? product.handle ?? product.id }}
-            </a>
-            <strong v-else>{{ product.title ?? product.handle ?? product.id }}</strong>
-            <small>{{ product.handle ?? product.id }}</small>
-            <div class="product-badges">
-              <span v-if="product.vendor">{{ product.vendor }}</span>
-              <span v-if="product.productType">{{ product.productType }}</span>
-              <span v-for="tag in product.tags.slice(0, 2)" :key="tag">#{{ tag }}</span>
-            </div>
-          </div>
-          <div class="product-facts">
-            <span class="stock-badge" :class="productAvailabilityState(product)">
-              {{ productAvailabilityLabel(product) }}
-            </span>
-            <strong>{{ product.variants.length }} <small>变体</small></strong>
-            <time>{{ displayDate(product.createdAt) }}</time>
-          </div>
-        </article>
-      </div>
-      <div v-else class="empty-results">
-        <UiIcon name="search" :size="26" />
-        <strong>没有匹配的产品</strong>
-        <span>调整搜索词或筛选条件后重试。</span>
-      </div>
-
-      <div class="pager">
-        <button
-          type="button"
-          class="page-action"
-          :disabled="productPage <= 1"
-          aria-label="上一页"
-          @click="productPage -= 1"
-        >
-          <UiIcon name="chevron-left" :size="16" /> 上一页
-        </button>
-        <span>第 <strong>{{ productPage }}</strong> / {{ productPageCount }} 页</span>
-        <button
-          type="button"
-          class="page-action"
-          :disabled="productPage >= productPageCount"
-          aria-label="下一页"
-          @click="productPage += 1"
-        >
-          下一页 <UiIcon name="chevron-right" :size="16" />
-        </button>
-      </div>
-    </section>
-
-    <section v-else-if="activeView === 'technology'" class="view-content technology-view">
-      <header class="view-heading">
-        <div>
-          <p class="eyebrow">FRONTEND INTELLIGENCE</p>
-          <h1>前端技术</h1>
-        </div>
-        <span v-if="frontend" class="result-count" :class="{ offline: frontend.status !== 'completed' }">
-          {{ frontend.status.toUpperCase() }}
-        </span>
-      </header>
-
-      <template v-if="frontend">
-        <div class="metric-grid technology-metrics">
-          <article>
-            <span class="metric-icon purple"><UiIcon name="code" /></span>
-            <div><small>发现资源</small><strong>{{ frontend.summary.totalResources }}</strong></div>
-          </article>
-          <article>
-            <span class="metric-icon green"><UiIcon name="shield" /></span>
-            <div><small>同源已分析</small><strong>{{ frontend.summary.analyzedResources }}</strong></div>
-          </article>
-          <article>
-            <span class="metric-icon blue"><UiIcon name="layers" /></span>
-            <div><small>跨源元数据</small><strong>{{ frontend.summary.crossOriginResources }}</strong></div>
-          </article>
-          <article>
-            <span class="metric-icon amber"><UiIcon name="database" /></span>
-            <div><small>分析正文</small><strong>{{ displayBytes(frontend.summary.analyzedBytes) }}</strong></div>
-          </article>
-        </div>
-
-        <p class="technology-notice">
-          只读取当前页面实际观察到的同源公开文本资源；跨源资源固定为 metadata-only。代码引用不代表接口可访问。
-        </p>
-        <p class="technology-notice">
-          App / Pixel 使用本地稳定规则；严格沙箱或服务端 Pixel 可能不可见，命中仅表示公开技术信号，不代表访问量或事件已送达。
-        </p>
-        <p v-if="frontendDegradation" class="technology-notice warning">
-          {{ frontendDegradation }}。产品与已成功的技术结果仍已原子提交。
-        </p>
-
-        <section class="content-card source-export-card">
-          <header class="card-heading">
-            <div>
-              <span class="section-icon green"><UiIcon name="download" /></span>
-              <div><h2>公开源码导出</h2><p>独立于普通 JSON；点击后重新经过 ResourcePolicy</p></div>
-            </div>
-            <span class="data-pill">{{ sourceBundleCandidates.length }}</span>
-          </header>
-          <div class="source-export-body">
-            <div class="source-export-facts">
-              <span><small>同源文件</small><strong>{{ sourceBundleCandidates.length }}</strong></span>
-              <span><small>预计正文</small><strong>{{ displayBytes(sourceBundleEstimatedBytes) }}</strong></span>
-              <span><small>来源</small><strong>{{ storeHost }}</strong></span>
-            </div>
-            <p>
-              仅重新读取当前会话已注册、且上次分析成功的公开文本；固定 omit credentials、禁止重定向，最多 100 个文件 / 20 MB。
-            </p>
-            <div class="source-export-actions">
-              <button
-                type="button"
-                data-testid="export-public-sources"
-                :disabled="busy || sourceExportBusy || !handle || sourceBundleCandidates.length === 0"
-                @click="exportPublicSources"
-              >
-                <UiIcon name="download" :size="14" />
-                {{ sourceExportBusy ? `导出中 ${sourceExportProgress}` : "导出公开源码 JSON" }}
-              </button>
-              <button
-                v-if="sourceExportBusy"
-                type="button"
-                class="secondary"
-                data-testid="cancel-source-export"
-                @click="cancelSourceExport()"
-              >
-                取消
-              </button>
-            </div>
-            <p v-if="sourceBundleCandidates.length === 0" class="source-export-empty">
-              当前快照没有已分析的同源文本；请先点击“重新扫描”。
-            </p>
-          </div>
-        </section>
-
-        <section class="content-card technology-card">
-          <header class="card-heading">
-            <div>
-              <span class="section-icon purple"><UiIcon name="layers" /></span>
-              <div><h2>技术栈与主题</h2><p>公开资源和代码特征</p></div>
-            </div>
-            <span class="data-pill">{{ technologyFindings(['framework', 'theme']).length }}</span>
-          </header>
-          <ul v-if="technologyFindings(['framework', 'theme']).length" class="finding-list">
-            <li v-for="finding in technologyFindings(['framework', 'theme'])" :key="finding.findingId">
-              <div><strong>{{ finding.label }}</strong><small>置信度 {{ Math.round(finding.confidence * 100) }}% · {{ finding.maturity }}</small></div>
-              <details>
-                <summary>{{ finding.evidence.length }} 条证据</summary>
-                <p v-for="evidence in finding.evidence" :key="`${evidence.resourceId}-${evidence.excerpt}`">{{ evidence.excerpt }}</p>
-              </details>
-            </li>
-          </ul>
-          <p v-else class="empty-copy">未发现足以展示的框架或主题代码特征。</p>
-        </section>
-
-        <section class="content-card technology-card">
-          <header class="card-heading">
-            <div>
-              <span class="section-icon blue"><UiIcon name="code" /></span>
-              <div><h2>API 代码引用</h2><p>仅表示字符串或 operation 出现在公开代码中</p></div>
-            </div>
-            <span class="data-pill">{{ technologyFindings(['api-reference']).length }}</span>
-          </header>
-          <ul v-if="technologyFindings(['api-reference']).length" class="finding-list compact">
-            <li v-for="finding in technologyFindings(['api-reference']).slice(0, 30)" :key="finding.findingId">
-              <div><strong>{{ finding.label }}</strong><small>{{ finding.evidence[0]?.excerpt }}</small></div>
-            </li>
-          </ul>
-          <p v-else class="empty-copy">未发现公开 API 路径或 GraphQL operation 引用。</p>
-        </section>
-
-        <section class="content-card technology-card">
-          <header class="card-heading">
-            <div>
-              <span class="section-icon green"><UiIcon name="radar" /></span>
-              <div><h2>App 与 Pixel</h2><p>稳定规则 {{ frontend.fingerprintRulesVersion }}；不推导销量或访问量</p></div>
-            </div>
-            <span class="data-pill">{{ technologyFindings(['app', 'pixel']).length }}</span>
-          </header>
-          <ul v-if="technologyFindings(['app', 'pixel']).length" class="finding-list">
-            <li v-for="finding in technologyFindings(['app', 'pixel'])" :key="finding.findingId">
-              <div>
-                <strong>{{ finding.label }}</strong>
-                <small>{{ finding.category.toUpperCase() }} · 置信度 {{ Math.round(finding.confidence * 100) }}% · {{ finding.maturity }}</small>
-              </div>
-              <details>
-                <summary>{{ finding.evidence.length }} 条规则命中</summary>
-                <p v-for="evidence in finding.evidence" :key="`${evidence.resourceId}-${evidence.excerpt}`">{{ evidence.excerpt }}</p>
-              </details>
-            </li>
-          </ul>
-          <p v-else class="empty-copy">当前规则未发现可展示的 App / Pixel 证据。</p>
-        </section>
-
-        <section class="content-card technology-card">
-          <header class="card-heading">
-            <div>
-              <span class="section-icon amber"><UiIcon name="trend" /></span>
-              <div><h2>性能与 Source Map</h2><p>Resource Timing 与静态边界检查</p></div>
-            </div>
-            <span class="data-pill">{{ technologyFindings(['performance', 'source-map']).length }}</span>
-          </header>
-          <ul v-if="technologyFindings(['performance', 'source-map']).length" class="finding-list compact">
-            <li v-for="finding in technologyFindings(['performance', 'source-map'])" :key="finding.findingId">
-              <div><strong>{{ finding.label }}</strong><small>{{ finding.evidence[0]?.excerpt }}</small></div>
-            </li>
-          </ul>
-          <p v-else class="empty-copy">没有超过静态阈值的性能或 source map 发现。</p>
-        </section>
-
-        <section class="content-card resource-inventory">
-          <header class="card-heading">
-            <div>
-              <span class="section-icon blue"><UiIcon name="database" /></span>
-              <div><h2>资源清单</h2><p>URL 已去 fragment；危险 query 不可重放</p></div>
-            </div>
-            <span class="data-pill">{{ frontendResources.length }}</span>
-          </header>
-          <div class="resource-list">
-            <article v-for="resource in visibleFrontendResources" :key="resource.resourceId">
-              <span class="resource-kind">{{ resource.kind }}</span>
-              <div>
-                <strong>{{ resourceHost(resource) }}</strong>
-                <small :title="resource.url">{{ resourcePath(resource) }}</small>
-                <small v-if="resource.derivedFromResourceId">
-                  SW 派生 capability · parent {{ resource.derivedFromResourceId.slice(0, 8) }}
-                </small>
-              </div>
-              <p>
-                <span :class="`resource-status ${resource.fetchStatus}`">{{ resource.fetchStatus }}</span>
-                <small>{{ displayBytes(resource.byteLength ?? resource.transferSize) }}</small>
-              </p>
-            </article>
-          </div>
-          <p v-if="frontendResources.length > 100" class="disclaimer">界面仅显示前 100 条；完整脱敏清单包含在 JSON 导出中。</p>
-        </section>
-      </template>
-
-      <section v-else class="empty-results technology-empty">
-        <UiIcon name="code" :size="26" />
-        <strong>当前快照尚无前端资源分析</strong>
-        <span>点击“重新扫描”生成 M3 Technology 结果；旧 M2 快照仍可继续查看产品数据。</span>
-      </section>
-    </section>
-
-    <section v-else class="view-content diagnostics-view">
-      <header class="view-heading">
-        <div>
-          <p class="eyebrow">TECHNICAL DIAGNOSTICS</p>
-          <h1>诊断工具</h1>
-        </div>
-        <span class="result-count" :class="{ offline: !handle }">
-          {{ handle ? "SESSION OK" : "NO SESSION" }}
-        </span>
-      </header>
-
-      <section class="diagnostic-card">
-        <header><h2>会话与探针</h2><p>常规使用无需操作这些项目。</p></header>
-        <div class="diagnostic-actions">
-          <button type="button" :disabled="busy" @click="establish">
-            <UiIcon name="shield" /> <span>检查授权<small>重建当前会话</small></span>
-          </button>
-          <button type="button" :disabled="busy || !handle" @click="runProbes">
-            <UiIcon name="code" /> <span>双探针<small>MAIN / ISOLATED</small></span>
-          </button>
-          <button type="button" :disabled="busy || !handle" @click="fetchCart">
-            <UiIcon name="database" /> <span>cart.js<small>匿名上下文</small></span>
-          </button>
-          <button type="button" :disabled="busy || !handle" @click="fetchProducts">
-            <UiIcon name="products" /> <span>products.json<small>能力探测</small></span>
-          </button>
-          <button type="button" :disabled="busy" @click="runStorageSmoke">
-            <UiIcon name="database" /> <span>IndexedDB<small>事务自检</small></span>
-          </button>
-          <button type="button" class="danger" :disabled="busy || !handle" @click="revoke">
-            <UiIcon name="revoke" /> <span>吊销会话<small>清除当前句柄</small></span>
-          </button>
-        </div>
-      </section>
-
-      <section class="diagnostic-output">
-        <header>
-          <div><h2>运行输出</h2><p v-if="bootId">SW boot · {{ bootId }}</p></div>
-          <span>{{ status }}</span>
-        </header>
-        <pre v-if="detail">{{ detail }}</pre>
-        <p v-else class="empty-copy">尚无诊断输出。</p>
-      </section>
-    </section>
-
-    <footer class="privacy-footer">
-      <UiIcon name="shield" :size="14" />
-      <span>仅分析公开店铺数据 · 不携带登录凭证</span>
+    <footer class="prototype-footer">
+      <UiIcon name="lock" :size="13" />
+      <span>真实 M0–M3 committed 快照 · omit credentials · 不持久化源码正文</span>
     </footer>
+
+    <PanelProductDrawer
+      v-if="selectedProduct"
+      :product="selectedProduct"
+      @close="selectedProduct = undefined"
+    />
   </main>
 </template>

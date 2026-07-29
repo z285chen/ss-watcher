@@ -346,6 +346,12 @@ describe("collectorProbe", () => {
                 transferSize: 512,
                 duration: 8,
               },
+              {
+                name: "https://store.example/api/collect",
+                initiatorType: "fetch",
+                transferSize: 300,
+                duration: 4,
+              },
             ]
           : [],
     });
@@ -374,6 +380,15 @@ describe("collectorProbe", () => {
           initiator: "fetch",
           transferSize: 512,
           durationMs: 8,
+        },
+        {
+          url: "https://store.example/api/collect",
+          kind: "other",
+          queryPolicy: "none",
+          sources: ["resource-timing"],
+          initiator: "fetch",
+          transferSize: 300,
+          durationMs: 4,
         },
       ]),
     });
