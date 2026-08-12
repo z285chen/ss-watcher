@@ -3,6 +3,7 @@
 import { computed, ref } from "vue";
 
 import ResearchBriefButton from "./ResearchBriefButton.vue";
+import TechnologyMark from "./TechnologyMark.vue";
 import UiIcon from "./UiIcon.vue";
 import {
   technologyBrief,
@@ -61,6 +62,26 @@ const visibleFindings = computed(() =>
     : props.findings.filter((finding) => finding.kind === activeKind.value),
 );
 
+const findingOrder: readonly PanelFindingKind[] = [
+  "theme",
+  "framework",
+  "app",
+  "pixel",
+  "api",
+  "performance",
+  "source-map",
+];
+
+const findingGroups = computed(() =>
+  findingOrder
+    .map((kind) => ({
+      kind,
+      label: kindLabels[kind],
+      findings: visibleFindings.value.filter((finding) => finding.kind === kind),
+    }))
+    .filter((group) => group.findings.length > 0),
+);
+
 const coreResources = computed(() =>
   props.resources.filter((resource) => resource.kind !== "source-map"),
 );
@@ -98,14 +119,6 @@ const visibleResources = computed(() =>
 const brief = computed(() =>
   technologyBrief(props.host, props.findings, props.summary),
 );
-
-function iconFor(kind: PanelFindingKind): "layers" | "radar" | "code" | "database" | "trend" {
-  if (kind === "theme") return "layers";
-  if (kind === "pixel" || kind === "app") return "radar";
-  if (kind === "api") return "code";
-  if (kind === "source-map") return "database";
-  return "trend";
-}
 
 function toggleFinding(id: string): void {
   expanded.value = expanded.value === id ? undefined : id;
@@ -229,26 +242,32 @@ function sourceMapReason(resource: PanelResource): string | undefined {
       >{{ kind.label }}</button>
     </div>
 
-    <section class="finding-stack" aria-label="技术发现">
-      <article
-        v-for="finding in visibleFindings"
-        :key="finding.id"
-        class="finding-row"
-        :class="{ expanded: expanded === finding.id }"
-      >
-        <button type="button" class="finding-trigger" :aria-expanded="expanded === finding.id" @click="toggleFinding(finding.id)">
-          <span :class="['finding-icon', finding.tone]"><UiIcon :name="iconFor(finding.kind)" :size="17" /></span>
-          <span class="finding-copy"><strong>{{ finding.label }}</strong><small>{{ kindLabels[finding.kind] }} · 置信度 {{ finding.confidence }} · {{ finding.maturity }}</small></span>
-          <UiIcon :name="expanded === finding.id ? 'chevron-up' : 'chevron-down'" :size="17" />
-        </button>
-        <div v-if="expanded === finding.id" class="finding-detail">
-          <p>{{ finding.summary }}</p>
-          <div class="finding-evidence">
-            <span v-for="evidence in finding.evidence" :key="evidence"><UiIcon name="check" :size="13" />{{ evidence }}</span>
+    <section class="finding-groups" aria-label="技术发现">
+      <section v-for="group in findingGroups" :key="group.kind" class="finding-group">
+        <h2>{{ group.label }}</h2>
+        <article
+          v-for="finding in group.findings"
+          :key="finding.id"
+          class="finding-row"
+          :class="{ expanded: expanded === finding.id }"
+        >
+          <button type="button" class="finding-trigger" :aria-expanded="expanded === finding.id" @click="toggleFinding(finding.id)">
+            <TechnologyMark :label="finding.label" :kind="finding.kind" />
+            <span class="finding-copy">
+              <strong>{{ finding.label }}</strong>
+              <small>置信度 {{ finding.confidence }} · {{ finding.maturity }}</small>
+            </span>
+            <UiIcon :name="expanded === finding.id ? 'chevron-up' : 'chevron-down'" :size="17" />
+          </button>
+          <div v-if="expanded === finding.id" class="finding-detail">
+            <p>{{ finding.summary }}</p>
+            <div class="finding-evidence">
+              <span v-for="evidence in finding.evidence" :key="evidence"><UiIcon name="check" :size="13" />{{ evidence }}</span>
+            </div>
+            <small>证据来自当前页面观察到的公开资源；源码正文不会写入快照。</small>
           </div>
-          <small>证据来自当前页面观察到的公开资源；源码正文不会写入快照。</small>
-        </div>
-      </article>
+        </article>
+      </section>
       <div v-if="visibleFindings.length === 0" class="catalog-empty">
         <UiIcon name="code" :size="24" />
         <strong>当前快照没有匹配的技术发现</strong>

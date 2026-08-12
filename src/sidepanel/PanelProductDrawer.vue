@@ -1,6 +1,6 @@
 <!-- Live M0–M3 presentation component. -->
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted } from "vue";
+import { nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 
 import ResearchBriefButton from "./ResearchBriefButton.vue";
 import UiIcon from "./UiIcon.vue";
@@ -14,25 +14,57 @@ const emit = defineEmits<{
   close: [];
 }>();
 
+const drawer = ref<HTMLElement>();
+const closeButton = ref<HTMLButtonElement>();
+let previouslyFocused: HTMLElement | undefined;
+
 function onKeydown(event: KeyboardEvent): void {
-  if (event.key === "Escape") emit("close");
+  if (event.key === "Escape") {
+    event.preventDefault();
+    emit("close");
+    return;
+  }
+  if (event.key !== "Tab" || drawer.value === undefined) return;
+  const focusable = [...drawer.value.querySelectorAll<HTMLElement>(
+    'button:not(:disabled), a[href], input:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])',
+  )];
+  if (focusable.length === 0) return;
+  const first = focusable[0];
+  const last = focusable.at(-1);
+  if (first === undefined || last === undefined) return;
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
-onMounted(() => window.addEventListener("keydown", onKeydown));
-onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
+onMounted(() => {
+  previouslyFocused = document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : undefined;
+  window.addEventListener("keydown", onKeydown);
+  void nextTick(() => closeButton.value?.focus());
+});
+onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onKeydown);
+  if (previouslyFocused?.isConnected) previouslyFocused.focus();
+});
 </script>
 
 <template>
   <Teleport to="body">
     <div class="product-drawer-backdrop" @click.self="emit('close')">
-      <aside class="product-drawer" role="dialog" aria-modal="true" :aria-label="`${product.title} 产品详情`">
+      <aside ref="drawer" class="product-drawer" role="dialog" aria-modal="true" :aria-label="`${product.title} 产品详情`">
         <header class="drawer-header">
           <div>
             <span class="content-kicker">公开产品详情</span>
             <h2>{{ product.title }}</h2>
             <p>{{ product.handle }}</p>
           </div>
-          <button type="button" class="drawer-close" aria-label="关闭产品详情" @click="emit('close')"><UiIcon name="close" :size="19" /></button>
+          <button ref="closeButton" type="button" class="drawer-close" aria-label="关闭产品详情" @click="emit('close')"><UiIcon name="close" :size="19" /></button>
         </header>
 
         <div v-if="product.image" class="drawer-product-visual">

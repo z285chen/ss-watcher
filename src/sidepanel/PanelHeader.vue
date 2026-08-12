@@ -61,14 +61,10 @@ function triggerPrimary(): void {
   <header class="prototype-header">
     <div class="prototype-brand">
       <span class="prototype-brand-mark"><img src="/icons/ss-watcher-48.png" alt="" /></span>
-      <div>
-        <strong>SS Watcher</strong>
-        <span>STOREFRONT INTELLIGENCE</span>
-      </div>
+      <strong>SS Watcher</strong>
     </div>
 
     <div class="prototype-header-actions">
-      <span class="prototype-tag">M3 LIVE</span>
       <div class="prototype-tools">
         <button
           type="button"
@@ -130,7 +126,7 @@ function triggerPrimary(): void {
         @click="triggerPrimary"
       >
         <UiIcon :name="state === 'scanning' ? 'cancel' : 'refresh'" :size="16" />
-        <span>{{ stateMeta.action }}</span>
+        <span class="prototype-scan-label">{{ stateMeta.action }}</span>
       </button>
     </div>
   </header>

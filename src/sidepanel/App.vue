@@ -213,6 +213,8 @@ const activePanelView = computed<PanelView>({
 const hasSnapshot = computed(() => currentBundle.value !== undefined);
 const scanActive = computed(() => activeScanId.value !== undefined);
 const partialMessage = computed(() => buildPartialMessage());
+const productPartialMessage = computed(() => buildProductPartialMessage());
+const technologyPartialMessage = computed(() => buildTechnologyPartialMessage());
 const panelState = computed<PanelState>(() => {
   if (scanActive.value) return "scanning";
   if (!hasSnapshot.value) return handle.value === undefined ? "unauthorized" : "empty";
@@ -281,6 +283,38 @@ function buildPartialMessage(): string | undefined {
     : [];
   if (criticalSnapshotErrors.length > 0) {
     messages.push(`快照记录 ${criticalSnapshotErrors.length} 条模块错误`);
+  }
+  const unique = [...new Set(messages)];
+  return unique.length === 0 ? undefined : unique.join("；");
+}
+
+function buildProductPartialMessage(): string | undefined {
+  const bundle = currentBundle.value;
+  if (bundle === undefined) return undefined;
+  const messages: string[] = [];
+  if (bundle.snapshot.scanStatus === "blocked") {
+    messages.push("产品扫描遇到密码、挑战或安全拒绝，当前仅展示已提交的可用目录");
+  } else if (bundle.snapshot.scanStatus === "partial") {
+    messages.push("产品或公开上下文为部分覆盖");
+  }
+  if (coverage.value?.truncated === true) {
+    messages.push("公开产品目录达到上限，列表已截断");
+  }
+  const unique = [...new Set(messages)];
+  return unique.length === 0 ? undefined : unique.join("；");
+}
+
+function buildTechnologyPartialMessage(): string | undefined {
+  const messages = [frontendDegradation.value, frontendCoverageLimit.value].filter(
+    (value): value is string => value !== undefined,
+  );
+  if (
+    frontend.value?.status === "failed" &&
+    frontend.value.errors.some(
+      (error) => !isFrontendResourceError(error, frontendResourceErrorIds.value),
+    )
+  ) {
+    messages.push("公开前端分析失败，资源描述符仍保留");
   }
   const unique = [...new Set(messages)];
   return unique.length === 0 ? undefined : unique.join("；");
@@ -1645,6 +1679,7 @@ onBeforeUnmount(() => {
       v-else-if="activeView === 'products'"
       :products="panelProducts"
       :store="panelStore"
+      :partial-message="productPartialMessage"
       @select="selectedProduct = $event"
       @export-csv="exportCsv"
     />
@@ -1655,7 +1690,7 @@ onBeforeUnmount(() => {
       :findings="panelFindings"
       :resources="panelResources"
       :summary="panelTechnologySummary"
-      :partial-message="partialMessage"
+      :partial-message="technologyPartialMessage"
       :can-export-sources="handle !== undefined && sourceBundleCandidates.length > 0 && !busy"
       :export-busy="sourceExportBusy"
       :export-progress="sourceExportProgress"

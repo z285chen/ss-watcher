@@ -13,6 +13,7 @@ import {
 const props = defineProps<{
   products: readonly PanelProduct[];
   store: PanelStore;
+  partialMessage?: string;
 }>();
 
 const emit = defineEmits<{
@@ -98,6 +99,11 @@ watch(
       <ResearchBriefButton compact :text="brief" label="复制摘要" />
     </header>
 
+    <div v-if="partialMessage" class="prototype-callout warning-callout compact-callout">
+      <UiIcon name="alert" :size="16" />
+      <p>{{ partialMessage }}</p>
+    </div>
+
     <div class="catalog-summary-line">
       <span><UiIcon name="check" :size="14" />匹配 {{ filteredRows.length }} / {{ products.length }} 个公开产品</span>
       <span>{{ store.sourceLabel }} · {{ store.priceVerified ? "价格已验证" : "价格待验证" }}</span>
@@ -105,7 +111,7 @@ watch(
 
     <label class="prototype-search">
       <UiIcon name="search" :size="18" />
-      <input v-model="query" type="search" placeholder="搜索标题、handle、Vendor 或 Tag" />
+      <input v-model="query" type="search" aria-label="搜索公开产品" placeholder="搜索标题、handle、Vendor 或 Tag" />
       <button v-if="query" type="button" aria-label="清除搜索" @click="query = ''"><UiIcon name="close" :size="15" /></button>
     </label>
 

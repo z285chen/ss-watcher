@@ -31,14 +31,13 @@ const brief = computed(() => overviewBrief(props.store));
       </div>
     </div>
 
-    <section class="store-pulse" aria-labelledby="store-pulse-title">
-      <div class="store-pulse-topline">
+    <section class="store-profile" aria-labelledby="store-pulse-title">
+      <div class="store-profile-topline">
         <span class="store-logo" aria-hidden="true">
           {{ store.initial }}
           <img v-if="store.favicon" :src="store.favicon" alt="" referrerpolicy="no-referrer" />
         </span>
-        <div class="store-pulse-heading">
-          <span class="content-kicker">店铺判断</span>
+        <div class="store-profile-heading">
           <h1 id="store-pulse-title">{{ store.host }}</h1>
           <p>{{ store.snapshotLabel }}</p>
         </div>
@@ -49,29 +48,30 @@ const brief = computed(() => overviewBrief(props.store));
       </div>
 
       <div class="store-facts" aria-label="店铺公开上下文">
-        <span><UiIcon name="layers" :size="14" />{{ store.theme }}</span>
-        <span><UiIcon name="globe" :size="14" />{{ store.market }}</span>
-        <span><UiIcon name="check" :size="14" />{{ store.storefront }}</span>
+        <div><span><UiIcon name="layers" :size="15" />主题</span><strong>{{ store.theme }}</strong></div>
+        <div><span><UiIcon name="globe" :size="15" />市场</span><strong>{{ store.market }}</strong></div>
+        <div><span><UiIcon name="check" :size="15" />店面类型</span><strong>{{ store.storefront }}</strong></div>
       </div>
+    </section>
 
-      <div class="store-pulse-summary">
-        <div>
-          <span>本次结论</span>
-          <strong>{{ store.summaryTitle }}</strong>
-        </div>
+    <section class="overview-conclusion" aria-labelledby="overview-conclusion-title">
+      <span>本次结论</span>
+      <div>
+        <strong id="overview-conclusion-title">{{ store.summaryTitle }}</strong>
         <p>{{ store.summaryBody }}</p>
       </div>
+    </section>
 
-      <div class="signal-rail" aria-label="关键指标">
-        <div><span>公开产品</span><strong>{{ store.productCount }}</strong></div>
-        <div><span>变体</span><strong>{{ store.variantCount }}</strong></div>
-        <div><span>折扣产品</span><strong>{{ store.discountedProducts }}</strong></div>
-        <div><span>技术信号</span><strong>{{ store.technologyCount }}</strong></div>
-      </div>
+    <section class="signal-rail" aria-label="关键指标">
+      <div><span>公开产品</span><strong>{{ store.productCount }}</strong></div>
+      <div><span>变体</span><strong>{{ store.variantCount }}</strong></div>
+      <div><span>折扣产品</span><strong>{{ store.discountedProducts }}</strong></div>
+      <div><span>技术信号</span><strong>{{ store.technologyCount }}</strong></div>
+    </section>
 
-      <div class="store-pulse-footer">
-        <div class="social-proof">
-          <span>公开账号</span>
+    <div class="overview-columns">
+      <section class="flat-group social-proof" aria-labelledby="social-title">
+          <h2 id="social-title">公开账号</h2>
           <div v-if="store.socials.length > 0">
             <a
               v-for="social in store.socials"
@@ -83,21 +83,15 @@ const brief = computed(() => overviewBrief(props.store));
             >{{ social.label }}</a>
           </div>
           <small v-else>未发现公开账号</small>
-        </div>
-        <ResearchBriefButton :text="brief" />
-      </div>
-    </section>
+      </section>
 
-    <section class="next-actions" aria-labelledby="next-actions-title">
-      <div class="section-heading">
-        <div>
-          <span class="content-kicker">下一步</span>
+      <section class="flat-group next-actions" aria-labelledby="next-actions-title">
+        <div class="flat-group-heading">
           <h2 id="next-actions-title">从结论进入证据</h2>
+          <ResearchBriefButton compact :text="brief" label="复制摘要" />
         </div>
-        <span>公开数据 · 可追溯</span>
-      </div>
       <button type="button" class="action-row" @click="emit('openProducts')">
-        <span class="action-icon purple"><UiIcon name="products" :size="19" /></span>
+        <span class="action-icon purple"><UiIcon name="products" :size="18" /></span>
         <span><strong>浏览产品结构</strong><small>{{ store.coverageLabel }}</small></span>
         <UiIcon name="chevron-right" :size="18" />
       </button>
@@ -109,15 +103,11 @@ const brief = computed(() => overviewBrief(props.store));
         </span>
         <UiIcon name="chevron-right" :size="18" />
       </button>
-    </section>
+      </section>
+    </div>
 
-    <section class="evidence-snapshot" aria-labelledby="evidence-snapshot-title">
-      <div class="section-heading">
-        <div>
-          <span class="content-kicker">公开信号</span>
-          <h2 id="evidence-snapshot-title">现在能确认什么</h2>
-        </div>
-      </div>
+    <section class="flat-group evidence-snapshot" aria-labelledby="evidence-snapshot-title">
+      <h2 id="evidence-snapshot-title">现在能确认什么</h2>
       <div class="evidence-list">
         <div>
           <span :class="['evidence-bullet', store.priceVerified ? 'success' : 'amber']">
