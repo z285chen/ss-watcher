@@ -13,6 +13,22 @@ import {
 } from "../content/probes";
 import type { StorefrontAnalysisResult } from "../core/analysis/storefront-analysis";
 import {
+  isDesignIntelligenceResult,
+  type DesignIntelligenceResult,
+} from "../core/design/design-intelligence";
+import { DesignSessionStore } from "../core/design/design-session-store";
+import { deriveEvidenceTransition } from "../core/design/interaction-evidence";
+import {
+  createSswDesignPackage,
+  sswDesignFilename,
+  type EvidenceAsset,
+  type EvidenceState,
+  type EvidenceTransition,
+  type InteractionActionKind,
+  type NodeRole,
+} from "../core/design/evidence-package";
+import { createStoredZip } from "../core/export/stored-zip";
+import {
   collectFrontendIntelligence,
   MAX_FRONTEND_RESOURCE_BODIES,
   MAX_FRONTEND_TOTAL_BYTES,
@@ -41,6 +57,11 @@ import type { StorefrontScanContext } from "../core/shopify/storefront-scanner";
 import { runIndexedDbSmoke } from "./indexeddb-smoke";
 import { createCommittedBundleState } from "./committed-bundle-state";
 import { shouldRetryActionAuthorization } from "./action-authorization-policy";
+import { canAttemptDesignCapture } from "./design-capture-availability";
+import {
+  captureFullPageState,
+} from "./design-capture-coordinator";
+import { DESIGN_VIEWPORT_PROFILES } from "../core/design/viewport-profiles";
 import PanelDiagnostics from "./PanelDiagnostics.vue";
 import PanelEmptyState from "./PanelEmptyState.vue";
 import PanelHeader from "./PanelHeader.vue";
@@ -79,6 +100,7 @@ import type {
   ProbeResponse,
   ResourceResponse,
   RevokeResponse,
+  DesignViewportLifecycleResponse,
   SessionHandle,
   ValidateSessionResponse,
 } from "../shared/messages";
@@ -101,6 +123,7 @@ const handle = ref<SessionHandle>();
 const bootId = ref("");
 const routeRoot = ref("/");
 const sessionOrigin = ref("");
+const sessionPathname = ref("");
 const sessionTabId = ref<number>();
 const busy = ref(false);
 const scanController = ref<AbortController>();
@@ -117,7 +140,80 @@ const toolsOpen = ref(false);
 // (used by the product view and export path) rejects reactive Proxy objects.
 const currentBundle = createCommittedBundleState();
 const panelInstanceId = crypto.randomUUID();
+// The background binds debugger ownership to this controller port. A normal
+// side-panel/popup close disconnects it even when Vue teardown cannot finish an
+// asynchronous END request, so the service worker can restore and detach.
+const designControllerPort = chrome.runtime.connect({
+  name: `design-controller:${panelInstanceId}`,
+});
+const startupParameters = new URLSearchParams(location.search);
+const detachedTargetWindowId = parseChromeId(startupParameters.get("targetWindowId"));
+const detachedTargetTabId = parseChromeId(startupParameters.get("targetTabId"));
+const detachedCaptureMode =
+  startupParameters.get("detachedCapture") === "1" &&
+  detachedTargetWindowId !== undefined &&
+  detachedTargetTabId !== undefined;
 const stagingStore = new StagingStore();
+const designSessionStore = new DesignSessionStore();
+const designSessionId = ref<string>();
+const designCaptureBusy = ref(false);
+const designCaptureController = ref<AbortController>();
+const designPreparedViewport = ref<Readonly<{
+  name: "desktop" | "tablet" | "mobile";
+  originalScrollY: number;
+}>>();
+const designCaptureStatus = ref("");
+const designStates = ref<EvidenceState[]>([defaultDesignState()]);
+const designTransitions = ref<EvidenceTransition[]>([]);
+const activeDesignStateId = ref("default");
+const designCapturedByState = ref<Record<string, Array<"desktop" | "tablet" | "mobile">>>({ default: [] });
+const designCapturedViewports = computed(
+  () => designCapturedByState.value[activeDesignStateId.value] ?? [],
+);
+const designActiveViewportScope = computed<readonly ("desktop" | "tablet" | "mobile")[]>(() => {
+  const state = designStates.value.find((candidate) => candidate.stateId === activeDesignStateId.value);
+  if (state?.kind !== "interaction") return ["desktop", "tablet", "mobile"];
+  return designTransitions.value.find((transition) => transition.toStateId === state.stateId)?.viewportScope ?? [];
+});
+const designStateOptions = computed(() => designStates.value.map((state) => ({
+  stateId: state.stateId,
+  label: state.kind === "default"
+    ? "默认状态"
+    : `交互态 ${state.ordinal} · ${designTransitions.value.find((transition) => transition.toStateId === state.stateId)?.trigger.kind ?? "待确认"}`,
+})));
+const designActiveStateContract = computed(() => {
+  const state = designStates.value.find((candidate) => candidate.stateId === activeDesignStateId.value);
+  if (state?.kind !== "interaction") return "当前状态合同：默认态 · desktop + tablet + mobile";
+  const transition = designTransitions.value.find((candidate) => candidate.toStateId === state.stateId);
+  if (transition === undefined) return `当前状态合同：${state.stateId} · 待确认`;
+  return `当前状态合同：${transition.trigger.kind} → ${transition.trigger.targetRole} · ${transition.viewportScope.join(" + ")}`;
+});
+const designPackageReady = computed(() => designStates.value.every((state) => {
+  const required = state.kind === "default"
+    ? (["desktop", "tablet", "mobile"] as const)
+    : designTransitions.value.find((transition) => transition.toStateId === state.stateId)?.viewportScope ?? [];
+  const captured = new Set(designCapturedByState.value[state.stateId] ?? []);
+  return required.length > 0 && required.every((viewport) => captured.has(viewport));
+}) && designTransitions.value.every((transition) => transition.status === "complete"));
+const designCanRecordInteraction = computed(() =>
+  designStates.value.length < 6 && designCapturedViewports.value.length > 0,
+);
+const designCanDeleteInteraction = computed(() => {
+  const active = designStates.value.find((state) => state.stateId === activeDesignStateId.value);
+  if (active?.kind !== "interaction" || designCapturedViewports.value.length > 0) return false;
+  const highestOrdinal = Math.max(...designStates.value.map((state) => state.ordinal));
+  return active.ordinal === highestOrdinal &&
+    !designTransitions.value.some((transition) => transition.fromStateId === active.stateId);
+});
+const designEvidenceOperationActive = computed(() =>
+  designCaptureBusy.value || designPreparedViewport.value !== undefined,
+);
+const designCaptureEnabled = computed(() => canAttemptDesignCapture({
+  detachedCaptureMode,
+  hasSessionHandle: handle.value !== undefined,
+  operationBusy: busy.value,
+  sourceExportBusy: sourceExportBusy.value,
+}));
 
 const products = computed(() => catalogProducts(currentBundle.value));
 const analysis = computed(() => analysisFromBundle(currentBundle.value));
@@ -135,6 +231,7 @@ const theme = computed(() => themeFromBundle(currentBundle.value));
 const themeLabel = computed(() => displayTheme(theme.value));
 const socialLinks = computed(() => socialsFromBundle(currentBundle.value));
 const frontend = computed(() => frontendFromBundle(currentBundle.value));
+const design = computed(() => designFromBundle(currentBundle.value));
 const frontendResources = computed(() => frontend.value?.resources ?? []);
 const visibleFrontendResources = computed(() => {
   const all = frontendResources.value;
@@ -621,6 +718,7 @@ function isFrontendResourceError(
 
 function handlePrimaryAction(): void {
   toolsOpen.value = false;
+  if (designEvidenceOperationActive.value) return;
   if (handle.value === undefined) {
     void establish();
     return;
@@ -672,7 +770,7 @@ function handleRuntimeNotice(message: unknown): false {
   // A delayed notice for the same healthy document must not replace its
   // resource-bearing session. A toolbar click on another tab (or after a
   // navigation that revoked the stored session) must rebind the open panel.
-  if (busy.value || sourceExportBusy.value) {
+  if (busy.value || sourceExportBusy.value || designEvidenceOperationActive.value) {
     return false;
   }
   void retryForActionWindow(message.windowId, message.tabId);
@@ -683,13 +781,13 @@ async function retryForActionWindow(
   actionWindowId: number,
   actionTabId: number,
 ): Promise<void> {
-  if (busy.value || sourceExportBusy.value) return;
+  if (busy.value || sourceExportBusy.value || designEvidenceOperationActive.value) return;
   const currentWindow = await chrome.windows.getCurrent();
   if (
     !shouldRetryActionAuthorization({
       actionWindowId,
       currentWindowId: currentWindow.id,
-      operationBusy: busy.value || sourceExportBusy.value,
+      operationBusy: busy.value || sourceExportBusy.value || designEvidenceOperationActive.value,
     })
   ) {
     return;
@@ -710,9 +808,10 @@ async function retryForActionWindow(
 
 async function send<T extends M0Response>(message: M0Request): Promise<T> {
   return new Promise<T>((resolve, reject) => {
+    const timeoutMs = message.type === "DESIGN_V2_CAPTURE_CHECKPOINT" ? 30_000 : 15_000;
     const timeoutId = globalThis.setTimeout(() => {
-      reject(new Error("Service Worker 15 秒内未应答"));
-    }, 15_000);
+      reject(new Error(`${message.type}：Service Worker ${timeoutMs / 1_000} 秒内未应答`));
+    }, timeoutMs);
     void (chrome.runtime.sendMessage(message) as Promise<T>).then(
       (response) => {
         globalThis.clearTimeout(timeoutId);
@@ -728,16 +827,21 @@ async function send<T extends M0Response>(message: M0Request): Promise<T> {
 
 async function establish(): Promise<void> {
   await runBusy(async () => {
-    status.value = "正在执行最小授权探针…";
-    const currentWindow = await chrome.windows.getCurrent();
+    status.value = detachedCaptureMode
+      ? "正在绑定显式授权的目标标签…"
+      : "正在执行最小授权探针…";
+    const currentWindow = detachedCaptureMode
+      ? { id: detachedTargetWindowId }
+      : await chrome.windows.getCurrent();
     if (typeof currentWindow.id !== "number") {
-      resetSession("无法确认当前窗口");
+      resetSession("无法确认目标窗口");
       return;
     }
 
     const response = await send<EstablishSessionResponse>({
       type: "M0_ESTABLISH_SESSION",
       windowId: currentWindow.id,
+      ...(detachedCaptureMode ? { targetTabId: detachedTargetTabId } : {}),
       panelInstanceId,
     });
     bootId.value = response.bootId;
@@ -750,8 +854,21 @@ async function establish(): Promise<void> {
       runId: response.session.runId,
       sessionToken: response.session.sessionToken,
     };
+    if (
+      sessionOrigin.value !== response.session.origin ||
+      sessionPathname.value !== response.session.pathname
+    ) {
+      designSessionId.value = undefined;
+      designStates.value = [defaultDesignState()];
+      designTransitions.value = [];
+      activeDesignStateId.value = "default";
+      designCapturedByState.value = { default: [] };
+      designCaptureStatus.value = "";
+    }
     sessionOrigin.value = response.session.origin;
+    sessionPathname.value = response.session.pathname;
     sessionTabId.value = response.session.tabId;
+    await resumeDesignSession(response.session.origin, response.session.pathname);
     routeRoot.value = "/";
     const latest = await stagingStore.getLatestCommittedSnapshot(
       response.session.origin,
@@ -779,7 +896,8 @@ async function scanM3(): Promise<void> {
     sessionHandle === undefined ||
     origin.length === 0 ||
     busy.value ||
-    sourceExportBusy.value
+    sourceExportBusy.value ||
+    designEvidenceOperationActive.value
   ) {
     return;
   }
@@ -870,6 +988,7 @@ async function scanM3(): Promise<void> {
         },
       },
       frontend: frontendPromise,
+      design: probeResponse.design,
     });
 
     const committed = await stagingStore.getCommittedSnapshot(
@@ -907,6 +1026,25 @@ async function scanM3(): Promise<void> {
       },
       runtimeDiagnostics: persisted.scan.runtimeDiagnostics,
       frontend: frontendFromBundle(committed)?.summary,
+      design:
+        probeResponse.design.status === "failed"
+          ? { status: "failed", errors: probeResponse.design.errors }
+          : {
+              status: probeResponse.design.status,
+              capture: probeResponse.design.capture,
+              coverage: probeResponse.design.coverage,
+              primitiveCounts: {
+                colors: probeResponse.design.primitives.colors.length,
+                typography: probeResponse.design.primitives.typography.length,
+                spacing: probeResponse.design.primitives.spacing.length,
+                radii: probeResponse.design.primitives.radii.length,
+                shadows: probeResponse.design.primitives.shadows.length,
+                cssVariables: probeResponse.design.primitives.cssVariables.length,
+                breakpoints: probeResponse.design.primitives.breakpoints.length,
+                components: probeResponse.design.components.length,
+              },
+              warnings: probeResponse.design.warnings,
+            },
       errors: committed.snapshot.errors,
     });
   } catch (error: unknown) {
@@ -1013,7 +1151,8 @@ async function exportPublicSources(): Promise<void> {
     bundle === undefined ||
     sessionHandle === undefined ||
     busy.value ||
-    sourceExportBusy.value
+    sourceExportBusy.value ||
+    designEvidenceOperationActive.value
   ) {
     return;
   }
@@ -1139,6 +1278,405 @@ function downloadText(filename: string, text: string, type: string): void {
   globalThis.setTimeout(() => URL.revokeObjectURL(url), 1_000);
 }
 
+function downloadBytes(filename: string, bytes: Uint8Array, type: string): void {
+  const blobBytes = Uint8Array.from(bytes);
+  const url = URL.createObjectURL(new Blob([blobBytes], { type }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.hidden = true;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  globalThis.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+}
+
+async function captureDesignViewport(
+  viewport: "desktop" | "tablet" | "mobile",
+): Promise<void> {
+  if (
+    designCaptureBusy.value ||
+    busy.value ||
+    sourceExportBusy.value
+  ) return;
+  if (handle.value === undefined && detachedCaptureMode) {
+    designCaptureStatus.value = "目标标签授权已失效，正在重新绑定后继续…";
+    await establish();
+  }
+  const sessionHandle = handle.value;
+  if (sessionHandle === undefined) {
+    designCaptureStatus.value = detachedCaptureMode
+      ? "目标标签重新绑定失败；请确认原标签仍在原窗口中处于活动状态。"
+      : "当前标签页没有有效授权，请重新点击扩展图标。";
+    return;
+  }
+  const activeState = designStates.value.find((state) => state.stateId === activeDesignStateId.value);
+  if (activeState?.kind === "interaction" && !designActiveViewportScope.value.includes(viewport)) {
+    designCaptureStatus.value = `${viewport} 不属于 ${activeState.stateId} 的验收范围。`;
+    return;
+  }
+  const prepared = designPreparedViewport.value;
+  if (prepared !== undefined && prepared.name !== viewport) {
+    designCaptureStatus.value = `请先完成或取消已准备的 ${prepared.name} 交互视口。`;
+    return;
+  }
+  if (activeState?.kind === "interaction" && prepared === undefined) {
+    designCaptureBusy.value = true;
+    try {
+      const begun = await send<DesignViewportLifecycleResponse>({
+        type: "DESIGN_V2_BEGIN_VIEWPORT_CAPTURE",
+        handle: sessionHandle,
+        panelInstanceId,
+        viewportName: viewport,
+      });
+      if (!begun.ok) throw new Error(begun.message);
+      if (!Number.isFinite(begun.originalScrollY) || (begun.originalScrollY ?? -1) < 0) {
+        await send<DesignViewportLifecycleResponse>({
+          type: "DESIGN_V2_END_VIEWPORT_CAPTURE",
+          handle: sessionHandle,
+          panelInstanceId,
+        }).catch(() => undefined);
+        throw new Error("准备交互视口前未能保存原滚动位置");
+      }
+      designPreparedViewport.value = {
+        name: viewport,
+        originalScrollY: begun.originalScrollY as number,
+      };
+      designCaptureStatus.value = `${viewport} 已准备。现在请在目标页面手动触发该交互，再点击同一按钮确认并采集。`;
+    } catch (error: unknown) {
+      designCaptureStatus.value = `交互视口准备失败：${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      designCaptureBusy.value = false;
+    }
+    return;
+  }
+  const viewportProfile = DESIGN_VIEWPORT_PROFILES[viewport];
+  const controller = new AbortController();
+  designCaptureController.value = controller;
+  designCaptureBusy.value = true;
+  try {
+    const sessionId = await ensureDesignSession();
+    designCaptureStatus.value = detachedCaptureMode
+      ? `正在从独立控制器模拟 ${viewportProfile.width}×${viewportProfile.height} ${viewport} 视口…`
+      : `正在模拟 ${viewportProfile.width}×${viewportProfile.height} ${viewport} 视口…`;
+    const result = await captureFullPageState({
+      send,
+      handle: sessionHandle,
+      panelInstanceId,
+      stateId: activeDesignStateId.value,
+      viewportName: viewport,
+      ...(prepared === undefined ? {} : { preparedViewport: prepared }),
+      signal: controller.signal,
+      onProgress: ({ completed, total }) => {
+        designCaptureStatus.value = `${viewport}：正在采集 ${completed}/${total}`;
+      },
+    });
+    await designSessionStore.putCapture(sessionId, result.capture, result.screenshots);
+    const storedSession = await designSessionStore.get(sessionId);
+    await designSessionStore.putAssets(
+      sessionId,
+      mergeEvidenceAssets(storedSession?.assets ?? [], result.assets),
+    );
+    await refreshDesignTransition(sessionId, activeDesignStateId.value);
+    designCapturedByState.value = {
+      ...designCapturedByState.value,
+      [activeDesignStateId.value]: [
+        ...new Set([...designCapturedViewports.value, viewport]),
+      ],
+    };
+    designCaptureStatus.value = result.capture.status === "complete"
+      ? `${activeDesignStateId.value} · ${viewport} 完整完成：${result.capture.screenshotSegments.length} 个连续截图分段`
+      : `${activeDesignStateId.value} · ${viewport} 部分完成：${result.capture.screenshotSegments.length} 个连续截图分段；缺口 ${result.capture.gaps.join("、")}`;
+  } catch (error: unknown) {
+    designCaptureStatus.value = error instanceof DOMException && error.name === "AbortError"
+      ? "采集已取消，页面滚动位置已恢复。"
+      : `采集失败：${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    if (designPreparedViewport.value?.name === viewport) designPreparedViewport.value = undefined;
+    if (designCaptureController.value === controller) designCaptureController.value = undefined;
+    designCaptureBusy.value = false;
+  }
+}
+
+async function cancelDesignCapture(): Promise<void> {
+  const controller = designCaptureController.value;
+  if (controller !== undefined) {
+    controller.abort(new DOMException("用户取消视觉证据采集", "AbortError"));
+    designCaptureStatus.value = "正在安全停止并恢复原滚动位置…";
+    return;
+  }
+  const prepared = designPreparedViewport.value;
+  const sessionHandle = handle.value;
+  if (prepared === undefined || sessionHandle === undefined || designCaptureBusy.value) return;
+  designCaptureBusy.value = true;
+  designCaptureStatus.value = "正在取消交互视口并恢复页面…";
+  let cleanupError: unknown;
+  try {
+    const ended = await send<DesignViewportLifecycleResponse>({
+      type: "DESIGN_V2_END_VIEWPORT_CAPTURE",
+      handle: sessionHandle,
+      panelInstanceId,
+    });
+    if (!ended.ok) throw new Error(ended.message);
+  } catch (error: unknown) {
+    cleanupError = error;
+  }
+  try {
+    const restored = await send({
+      type: "DESIGN_V2_RESTORE_SCROLL",
+      handle: sessionHandle,
+      panelInstanceId,
+      scrollY: prepared.originalScrollY,
+    });
+    if (!restored.ok) throw new Error(restored.message);
+  } catch (error: unknown) {
+    cleanupError ??= error;
+  } finally {
+    designPreparedViewport.value = undefined;
+    designCaptureBusy.value = false;
+  }
+  designCaptureStatus.value = cleanupError === undefined
+    ? "交互视口已取消，页面已恢复。"
+    : `交互视口取消失败：${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
+}
+
+async function ensureDesignSession(): Promise<string> {
+  const existing = designSessionId.value;
+  if (existing !== undefined) return existing;
+  const sessionId = crypto.randomUUID();
+  const host = new URL(sessionOrigin.value).hostname
+    .replace(/[^a-z0-9]+/giu, "-")
+    .replace(/^-+|-+$/gu, "")
+    .toLowerCase()
+    .slice(0, 48) || "page";
+  const packageId = `${host}-${new Date().toISOString().slice(0, 10)}`;
+  await designSessionStore.create({
+    sessionId,
+    packageId,
+    source: { origin: sessionOrigin.value, pathname: sessionPathname.value },
+  });
+  const defaultState = defaultDesignState();
+  await designSessionStore.putState(sessionId, defaultState);
+  designStates.value = [defaultState];
+  designTransitions.value = [];
+  activeDesignStateId.value = "default";
+  designCapturedByState.value = { default: [] };
+  designSessionId.value = sessionId;
+  return sessionId;
+}
+
+async function resumeDesignSession(origin: string, pathname: string): Promise<void> {
+  if (designSessionId.value !== undefined) return;
+  const resumed = await designSessionStore.latestForSource({ origin, pathname });
+  if (resumed === undefined) return;
+  const capturedByState: Record<string, Array<"desktop" | "tablet" | "mobile">> = {};
+  for (const state of resumed.states) capturedByState[state.stateId] = [];
+  for (const capture of resumed.captures) {
+    const viewports = capturedByState[capture.stateId];
+    if (viewports !== undefined && !viewports.includes(capture.viewport.name)) {
+      viewports.push(capture.viewport.name);
+    }
+  }
+  designSessionId.value = resumed.sessionId;
+  designStates.value = [...resumed.states].sort((left, right) => left.ordinal - right.ordinal);
+  designTransitions.value = [...resumed.transitions];
+  activeDesignStateId.value = designStates.value[0]?.stateId ?? "default";
+  designCapturedByState.value = capturedByState;
+  designCaptureStatus.value = `已恢复 ${resumed.states.length} 个状态、${resumed.captures.length} 个视口证据；有效至 ${displaySnapshotTime(resumed.expiresAt)}`;
+}
+
+async function recordDesignInteractionState(input: Readonly<{
+  actionKind: InteractionActionKind;
+  targetRole: NodeRole;
+  viewportScope: readonly ("desktop" | "tablet" | "mobile")[];
+}>): Promise<void> {
+  if (
+    designCaptureBusy.value || designPreparedViewport.value !== undefined ||
+    designStates.value.length >= 6 || input.viewportScope.length < 1
+  ) return;
+  const capturedSource = new Set(designCapturedViewports.value);
+  const missingSourceViewport = input.viewportScope.find((viewport) => !capturedSource.has(viewport));
+  if (missingSourceViewport !== undefined) {
+    designCaptureStatus.value = `来源状态尚未完成 ${missingSourceViewport}，不能建立该范围的交互证据。`;
+    return;
+  }
+  designCaptureBusy.value = true;
+  try {
+    const sessionId = await ensureDesignSession();
+    const ordinal = designStates.value.length;
+    const state: EvidenceState = {
+      stateId: `interaction-${ordinal}`,
+      kind: "interaction",
+      ordinal,
+      trigger: "user-confirmed",
+      enteredFromStateId: activeDesignStateId.value,
+      // A user-marked group is evidence of pixels captured while the user says
+      // the page is in a given state. Without a before/after fingerprint and
+      // reproducible trigger description it must not claim enter/exit/reset.
+      canExit: false,
+      canReset: false,
+    };
+    await designSessionStore.putState(sessionId, state);
+    const session = await designSessionStore.get(sessionId);
+    if (session === undefined) throw new Error("本地证据会话已过期或不存在");
+    const transition = deriveEvidenceTransition({
+      transitionId: `transition-${ordinal}`,
+      fromStateId: state.enteredFromStateId,
+      toStateId: state.stateId,
+      viewportScope: input.viewportScope,
+      actionKind: input.actionKind,
+      targetRole: input.targetRole,
+      captures: session.captures,
+    });
+    await designSessionStore.putTransition(sessionId, transition);
+    designStates.value = [...designStates.value, state];
+    designTransitions.value = [...designTransitions.value, transition];
+    activeDesignStateId.value = state.stateId;
+    designCapturedByState.value = { ...designCapturedByState.value, [state.stateId]: [] };
+    designCaptureStatus.value = `${state.stateId} 已建立：${input.actionKind} → ${input.targetRole} · ${input.viewportScope.join(" + ")}；完成范围内视口后将生成前后差异证据。`;
+  } catch (error: unknown) {
+    designCaptureStatus.value = `状态记录失败：${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    designCaptureBusy.value = false;
+  }
+}
+
+async function refreshDesignTransition(sessionId: string, stateId: string): Promise<void> {
+  const existing = designTransitions.value.find((transition) => transition.toStateId === stateId);
+  if (existing === undefined) return;
+  const session = await designSessionStore.get(sessionId);
+  if (session === undefined) throw new Error("本地证据会话已过期或不存在");
+  const refreshed = deriveEvidenceTransition({
+    transitionId: existing.transitionId,
+    fromStateId: existing.fromStateId,
+    toStateId: existing.toStateId,
+    viewportScope: existing.viewportScope,
+    actionKind: existing.trigger.kind,
+    targetRole: existing.trigger.targetRole,
+    captures: session.captures,
+  });
+  await designSessionStore.putTransition(sessionId, refreshed);
+  designTransitions.value = designTransitions.value.map((transition) =>
+    transition.transitionId === refreshed.transitionId ? refreshed : transition,
+  );
+}
+
+async function deleteCurrentDesignInteractionState(): Promise<void> {
+  const sessionId = designSessionId.value;
+  const state = designStates.value.find((candidate) => candidate.stateId === activeDesignStateId.value);
+  if (
+    sessionId === undefined || state?.kind !== "interaction" ||
+    !designCanDeleteInteraction.value || designEvidenceOperationActive.value
+  ) return;
+  designCaptureBusy.value = true;
+  try {
+    const updated = await designSessionStore.deleteLeafInteractionState(sessionId, state.stateId);
+    designStates.value = [...updated.states].sort((left, right) => left.ordinal - right.ordinal);
+    designTransitions.value = [...updated.transitions];
+    const nextCaptured = { ...designCapturedByState.value };
+    delete nextCaptured[state.stateId];
+    designCapturedByState.value = nextCaptured;
+    activeDesignStateId.value = state.enteredFromStateId;
+    designCaptureStatus.value = `${state.stateId} 已删除并返回其来源状态 ${state.enteredFromStateId}；其余状态和截图证据保持不变。需要继续其他交互态时请从证据状态下拉框选择。`;
+  } catch (error: unknown) {
+    designCaptureStatus.value = `删除交互态失败：${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    designCaptureBusy.value = false;
+  }
+}
+
+function selectDesignState(stateId: string): void {
+  if (designEvidenceOperationActive.value) return;
+  if (!designStates.value.some((state) => state.stateId === stateId)) return;
+  activeDesignStateId.value = stateId;
+  designCaptureStatus.value = stateId === "default"
+    ? "已切到默认状态证据槽；请确认页面也已恢复默认状态。"
+    : `已切到 ${stateId}；每个视口先准备，再由你手动重现交互，最后确认采集。`;
+}
+
+async function openDetachedDesignController(): Promise<void> {
+  if (
+    detachedCaptureMode ||
+    sessionTabId.value === undefined ||
+    sessionOrigin.value === "" ||
+    designEvidenceOperationActive.value
+  ) return;
+  const currentWindow = await chrome.windows.getCurrent();
+  if (typeof currentWindow.id !== "number") {
+    designCaptureStatus.value = "无法确认当前目标窗口";
+    return;
+  }
+  const url = new URL(chrome.runtime.getURL("sidepanel/index.html"));
+  url.searchParams.set("detachedCapture", "1");
+  url.searchParams.set("targetWindowId", String(currentWindow.id));
+  url.searchParams.set("targetTabId", String(sessionTabId.value));
+  await chrome.windows.create({
+    url: url.href,
+    type: "popup",
+    width: 520,
+    height: 900,
+    focused: true,
+  });
+  designCaptureStatus.value = "独立控制器已打开。请关闭本侧栏，让目标页面获得真实可见宽度；后续操作都在独立窗口完成。";
+}
+
+async function exportDesignPackage(): Promise<void> {
+  const sessionId = designSessionId.value;
+  if (sessionId === undefined || designEvidenceOperationActive.value) return;
+  designCaptureBusy.value = true;
+  try {
+    const session = await designSessionStore.get(sessionId);
+    if (session === undefined) throw new Error("本地证据会话已过期或不存在");
+    const incompleteState = session.states.find((state) => {
+      const required = state.kind === "default"
+        ? (["desktop", "tablet", "mobile"] as const)
+        : session.transitions.find((transition) => transition.toStateId === state.stateId)?.viewportScope ?? [];
+      const captured = new Set(session.captures
+        .filter((capture) => capture.stateId === state.stateId)
+        .map((capture) => capture.viewport.name));
+      return required.length < 1 || !required.every((viewport) => captured.has(viewport));
+    });
+    if (incompleteState !== undefined) {
+      throw new Error(`${incompleteState.stateId} 尚未完成其声明的视口范围`);
+    }
+    const screenshots = await designSessionStore.files(sessionId);
+    const evidencePackage = await createSswDesignPackage({
+      packageId: session.packageId,
+      createdAt: session.createdAt,
+      source: session.source,
+      states: session.states,
+      captures: session.captures,
+      transitions: session.transitions,
+      assets: session.assets,
+      screenshots,
+    });
+    const zip = createStoredZip(evidencePackage.files, new Date(session.createdAt));
+    downloadBytes(sswDesignFilename(session.packageId), zip, "application/zip");
+    designCaptureStatus.value = `已导出 ${evidencePackage.files.length} 个文件；证据摘要 ${evidencePackage.packageDigest.slice(0, 12)}`;
+  } catch (error: unknown) {
+    designCaptureStatus.value = `导出失败：${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    designCaptureBusy.value = false;
+  }
+}
+
+async function clearDesignSession(): Promise<void> {
+  const sessionId = designSessionId.value;
+  if (sessionId === undefined || designEvidenceOperationActive.value) return;
+  designCaptureBusy.value = true;
+  try {
+    await designSessionStore.delete(sessionId);
+    designSessionId.value = undefined;
+    designStates.value = [defaultDesignState()];
+    designTransitions.value = [];
+    activeDesignStateId.value = "default";
+    designCapturedByState.value = { default: [] };
+    designCaptureStatus.value = "本次本地证据已清除";
+  } finally {
+    designCaptureBusy.value = false;
+  }
+}
+
 async function runProbes(): Promise<void> {
   const sessionHandle = handle.value;
   if (sessionHandle === undefined) return;
@@ -1159,6 +1697,7 @@ async function runProbes(): Promise<void> {
     detail.value = pretty({
       main: response.main,
       collector: response.collector,
+      design: response.design,
       routeRootForRequests: routeRoot.value,
     });
   });
@@ -1245,10 +1784,13 @@ async function runBusy(operation: () => Promise<void>): Promise<void> {
 function resetSession(message: string, reason = ""): void {
   cancelActiveScan(new DOMException("会话已重置", "AbortError"));
   cancelSourceExport("会话已重置");
+  designCaptureController.value?.abort(new DOMException("会话已重置", "AbortError"));
+  designPreparedViewport.value = undefined;
   scanController.value = undefined;
   activeScanId.value = undefined;
   handle.value = undefined;
   sessionOrigin.value = "";
+  sessionPathname.value = "";
   sessionTabId.value = undefined;
   routeRoot.value = "/";
   status.value = message;
@@ -1334,6 +1876,13 @@ function frontendFromBundle(
     Array.isArray(value.errors)
     ? (value as unknown as FrontendIntelligenceResult)
     : undefined;
+}
+
+function designFromBundle(
+  bundle: CommittedSnapshotBundle | undefined,
+): DesignIntelligenceResult | undefined {
+  const value = bundle?.snapshot.design;
+  return isDesignIntelligenceResult(value) ? value : undefined;
 }
 
 function resourceHost(resource: ResourceDescriptor): string {
@@ -1593,16 +2142,64 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function parseChromeId(value: string | null): number | undefined {
+  if (value === null || !/^\d{1,10}$/u.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
+function defaultDesignState(): EvidenceState {
+  return {
+    stateId: "default",
+    kind: "default",
+    ordinal: 0,
+    trigger: "initial",
+    enteredFromStateId: null,
+    canExit: false,
+    canReset: true,
+  };
+}
+
+function mergeEvidenceAssets(
+  existing: readonly EvidenceAsset[],
+  incoming: readonly EvidenceAsset[],
+): EvidenceAsset[] {
+  const merged = new Map<string, EvidenceAsset>();
+  for (const asset of [...existing, ...incoming]) {
+    const key = `${asset.kind}:${asset.url}`;
+    const previous = merged.get(key);
+    merged.set(key, previous === undefined ? asset : {
+      ...previous,
+      width: previous.width ?? asset.width,
+      height: previous.height ?? asset.height,
+      usageNodeNumbers: [...new Set([...previous.usageNodeNumbers, ...asset.usageNodeNumbers])].slice(0, 100),
+    });
+  }
+  return [...merged.values()].slice(0, 1_000).map((asset, assetNumber) => ({
+    ...asset,
+    assetNumber,
+  }));
+}
+
 onMounted(() => {
   chrome.runtime.onMessage.addListener(handleRuntimeNotice);
-  void establish();
+  void designSessionStore.purgeExpired();
+  if (detachedCaptureMode) {
+    status.value = "独立采集控制器已就绪；点击建立授权以绑定明确的目标标签。";
+    detail.value = "目标标签必须仍在其窗口内处于 active，且 origin/path/documentId 不变；不会扩大权限。";
+  } else {
+    void establish();
+  }
 });
 
 onBeforeUnmount(() => {
   chrome.runtime.onMessage.removeListener(handleRuntimeNotice);
   cancelActiveScan(new DOMException("Side Panel 已关闭", "AbortError"));
   cancelSourceExport("Side Panel 已关闭");
+  designCaptureController.value?.abort(new DOMException("采集控制器已关闭", "AbortError"));
+  designControllerPort.disconnect();
   void stagingStore.close();
+  void designSessionStore.close();
 });
 </script>
 
@@ -1613,10 +2210,10 @@ onBeforeUnmount(() => {
       :tools-open="toolsOpen"
       :status="hasSnapshot ? `${panelStore.host} · ${status}` : status"
       :product-count="hasSnapshot ? panelStore.productCount : 0"
-      :can-scan="handle !== undefined && !busy && !sourceExportBusy"
-      :can-export="hasSnapshot && !busy && !sourceExportBusy"
-      :can-export-sources="hasSnapshot && handle !== undefined && sourceBundleCandidates.length > 0 && !busy"
-      :operation-busy="busy || sourceExportBusy"
+      :can-scan="handle !== undefined && !busy && !sourceExportBusy && !designEvidenceOperationActive"
+      :can-export="hasSnapshot && !busy && !sourceExportBusy && !designEvidenceOperationActive"
+      :can-export-sources="hasSnapshot && handle !== undefined && sourceBundleCandidates.length > 0 && !busy && !designEvidenceOperationActive"
+      :operation-busy="busy || sourceExportBusy || designEvidenceOperationActive"
       :source-export-busy="sourceExportBusy"
       :source-export-progress="sourceExportProgress"
       @primary="handlePrimaryAction"
@@ -1690,11 +2287,35 @@ onBeforeUnmount(() => {
       :findings="panelFindings"
       :resources="panelResources"
       :summary="panelTechnologySummary"
+      :design="design"
       :partial-message="technologyPartialMessage"
-      :can-export-sources="handle !== undefined && sourceBundleCandidates.length > 0 && !busy"
+      :can-export-sources="handle !== undefined && sourceBundleCandidates.length > 0 && !busy && !designEvidenceOperationActive"
       :export-busy="sourceExportBusy"
       :export-progress="sourceExportProgress"
+      :design-capture-enabled="designCaptureEnabled"
+      :design-capture-busy="designCaptureBusy"
+      :design-capture-cancelable="designCaptureController !== undefined || designPreparedViewport !== undefined"
+      :design-capture-status="designCaptureStatus"
+      :design-captured-viewports="designCapturedViewports"
+      :design-active-viewport-scope="designActiveViewportScope"
+      :design-prepared-viewport="designPreparedViewport?.name"
+      :design-detached-controller-enabled="!detachedCaptureMode"
+      :design-states="designStateOptions"
+      :design-active-state-id="activeDesignStateId"
+      :design-active-state-contract="designActiveStateContract"
+      :design-can-record-state="designCanRecordInteraction"
+      :design-can-delete-state="designCanDeleteInteraction"
+      :design-package-ready="designPackageReady"
+      :design-has-evidence-session="designSessionId !== undefined"
       @export-sources="handleExportSources"
+      @capture-design="captureDesignViewport"
+      @cancel-design-capture="cancelDesignCapture"
+      @export-design="exportDesignPackage"
+      @clear-design="clearDesignSession"
+      @open-detached-design-controller="openDetachedDesignController"
+      @record-design-state="recordDesignInteractionState"
+      @delete-design-state="deleteCurrentDesignInteractionState"
+      @select-design-state="selectDesignState"
     />
 
     <footer class="prototype-footer">

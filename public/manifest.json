@@ -4,7 +4,7 @@
   "version": "0.3.0",
   "description": "Local-only Shopify storefront catalog and frontend intelligence tool.",
   "minimum_chrome_version": "116",
-  "permissions": ["activeTab", "scripting", "storage", "sidePanel"],
+  "permissions": ["activeTab", "debugger", "scripting", "storage", "sidePanel"],
   "optional_host_permissions": [],
   "background": {
     "service_worker": "assets/service-worker.js",

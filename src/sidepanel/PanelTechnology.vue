@@ -2,6 +2,9 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 
+import type { DesignIntelligenceResult } from "../core/design/design-intelligence";
+import type { InteractionActionKind, NodeRole } from "../core/design/evidence-package";
+import PanelDesignIntelligence from "./PanelDesignIntelligence.vue";
 import ResearchBriefButton from "./ResearchBriefButton.vue";
 import TechnologyMark from "./TechnologyMark.vue";
 import UiIcon from "./UiIcon.vue";
@@ -18,14 +21,38 @@ const props = defineProps<{
   findings: readonly PanelFinding[];
   resources: readonly PanelResource[];
   summary?: PanelTechnologySummary;
+  design?: DesignIntelligenceResult;
   partialMessage?: string;
   canExportSources: boolean;
   exportBusy: boolean;
   exportProgress: string;
+  designCaptureEnabled: boolean;
+  designCaptureBusy: boolean;
+  designCaptureCancelable: boolean;
+  designCaptureStatus: string;
+  designCapturedViewports: readonly string[];
+  designActiveViewportScope: readonly ("desktop" | "tablet" | "mobile")[];
+  designPreparedViewport?: "desktop" | "tablet" | "mobile";
+  designDetachedControllerEnabled: boolean;
+  designStates: readonly Readonly<{ stateId: string; label: string }> [];
+  designActiveStateId: string;
+  designActiveStateContract: string;
+  designCanRecordState: boolean;
+  designCanDeleteState: boolean;
+  designPackageReady: boolean;
+  designHasEvidenceSession: boolean;
 }>();
 
 const emit = defineEmits<{
   exportSources: [];
+  captureDesign: [viewport: "desktop" | "tablet" | "mobile"];
+  cancelDesignCapture: [];
+  exportDesign: [];
+  clearDesign: [];
+  openDetachedDesignController: [];
+  recordDesignState: [input: Readonly<{ actionKind: InteractionActionKind; targetRole: NodeRole; viewportScope: readonly ("desktop" | "tablet" | "mobile")[] }>];
+  deleteDesignState: [];
+  selectDesignState: [stateId: string];
 }>();
 
 const activeKind = ref<"all" | PanelFindingKind>("all");
@@ -170,6 +197,34 @@ function sourceMapReason(resource: PanelResource): string | undefined {
     </section>
 
     <p class="technology-boundary"><UiIcon name="shield" :size="14" />同源正文仅在受限会话中短暂分析；跨源资源保持 metadata-only。代码引用不表示接口可访问。</p>
+
+    <PanelDesignIntelligence
+      v-if="design"
+      :result="design"
+      :capture-enabled="designCaptureEnabled"
+      :capture-busy="designCaptureBusy"
+      :capture-cancelable="designCaptureCancelable"
+      :capture-status="designCaptureStatus"
+      :captured-viewports="designCapturedViewports"
+      :active-viewport-scope="designActiveViewportScope"
+      :prepared-viewport="designPreparedViewport"
+      :detached-controller-enabled="designDetachedControllerEnabled"
+      :states="designStates"
+      :active-state-id="designActiveStateId"
+      :active-state-contract="designActiveStateContract"
+      :can-record-state="designCanRecordState"
+      :can-delete-state="designCanDeleteState"
+      :package-ready="designPackageReady"
+      :has-evidence-session="designHasEvidenceSession"
+      @capture="emit('captureDesign', $event)"
+      @cancel-capture="emit('cancelDesignCapture')"
+      @export-package="emit('exportDesign')"
+      @clear-session="emit('clearDesign')"
+      @open-detached-controller="emit('openDetachedDesignController')"
+      @record-state="emit('recordDesignState', $event)"
+      @delete-state="emit('deleteDesignState')"
+      @select-state="emit('selectDesignState', $event)"
+    />
 
     <section
       v-if="summary && summary.sourceMapUnavailableResources > 0"

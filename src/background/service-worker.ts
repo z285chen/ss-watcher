@@ -2,6 +2,7 @@ import {
   SessionManager,
   type AuthorizationProbeInjectionResult,
   type MessageSenderLike,
+  type ScanSession,
   type SessionHandle,
   type SessionManagerChromeApi,
   type TabLike,
@@ -20,6 +21,17 @@ import {
   type CollectorProbeResult,
   type ShopifyProbeResult,
 } from "../content/probes";
+import {
+  designIntelligenceProbe,
+  type DesignProbeResult,
+} from "../content/design-probe";
+import {
+  redactedComponentGraphProbe,
+  readCaptureScrollPosition,
+  readSettledCaptureCheckpoint,
+  scrollCaptureCheckpoint,
+  type RedactedComponentProbeResult,
+} from "../content/redacted-component-probe";
 import type {
   M0ActionAuthorizedNotice,
   M0ErrorResponse,
@@ -39,6 +51,15 @@ import type {
 } from "../core/frontend/resource-types";
 import { ResourceScanBudgetRegistry } from "./resource-scan-budget";
 import { SidePanelBindingController } from "./side-panel-binding";
+import {
+  emptyDesignIntelligence,
+  isDesignIntelligenceResult,
+  type DesignIntelligenceResult,
+} from "../core/design/design-intelligence";
+import {
+  compareCaptureMetrics,
+  DesignDebuggerCapture,
+} from "./design-debugger-capture";
 
 const bootId = crypto.randomUUID();
 const sessionManager = new SessionManager(createSessionApi());
@@ -52,6 +73,8 @@ const sidePanelBinding = new SidePanelBindingController({
   },
   storage: chrome.storage.session,
 });
+const designDebuggerCapture = new DesignDebuggerCapture(chrome.debugger);
+const DESIGN_CONTROLLER_PORT_PREFIX = "design-controller:";
 
 void configureExtension();
 
@@ -88,14 +111,18 @@ chrome.runtime.onStartup.addListener(() => {
 chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
   inFlightRequests.cancelInactiveForWindow(windowId, tabId);
   resourceBudgets.cancelInactiveForWindow(windowId, tabId);
-  void sessionManager.revokeInactiveForWindow(windowId, tabId);
+  void sessionManager.revokeInactiveForWindow(
+    windowId,
+    tabId,
+    cleanupDesignSessionBeforeRevoke,
+  );
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.url !== undefined || changeInfo.status === "loading") {
     inFlightRequests.cancelTab(tabId);
     resourceBudgets.cancelTab(tabId);
-    void sessionManager.revokeByTab(tabId);
+    void sessionManager.revokeByTab(tabId, cleanupDesignSessionBeforeRevoke);
   }
   if (changeInfo.url !== undefined) {
     void sidePanelBinding.handleNavigation(tabId, changeInfo.url);
@@ -105,26 +132,48 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   inFlightRequests.cancelTab(tabId);
   resourceBudgets.cancelTab(tabId);
-  void sessionManager.revokeByTab(tabId);
+  void sessionManager.revokeByTab(tabId, cleanupDesignSessionBeforeRevoke);
   void sidePanelBinding.disableTab(tabId);
+});
+
+chrome.debugger.onDetach.addListener((source) => {
+  if (source.tabId !== undefined) designDebuggerCapture.noteDetached(source.tabId);
+});
+
+chrome.runtime.onSuspend.addListener(() => {
+  void designDebuggerCapture.cancelAll().catch(() => undefined);
 });
 
 chrome.windows.onRemoved.addListener((windowId) => {
   inFlightRequests.cancelWindow(windowId);
   resourceBudgets.cancelWindow(windowId);
-  void sessionManager.revokeByWindow(windowId);
+  void sessionManager.revokeByWindow(windowId, cleanupDesignSessionBeforeRevoke);
 });
 
 chrome.windows.onFocusChanged.addListener((windowId) => {
   if (windowId === chrome.windows.WINDOW_ID_NONE) {
     inFlightRequests.cancelAll();
     resourceBudgets.clear();
-    void sessionManager.revokeAll();
+    void sessionManager.revokeOnFocusLoss(cleanupDesignSessionBeforeRevoke);
   } else {
     inFlightRequests.cancelOutsideWindow(windowId);
     resourceBudgets.cancelOutsideWindow(windowId);
-    void sessionManager.revokeOutsideWindow(windowId);
+    void sessionManager.revokeOutsideWindow(
+      windowId,
+      cleanupDesignSessionBeforeRevoke,
+    );
   }
+});
+
+chrome.runtime.onConnect.addListener((port) => {
+  const panelInstanceId = validDesignControllerPort(port);
+  if (panelInstanceId === undefined) return;
+  port.onDisconnect.addListener(() => {
+    void sessionManager.revokeByPanelInstance(
+      panelInstanceId,
+      cleanupDesignSessionBeforeRevoke,
+    );
+  });
 });
 
 chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
@@ -151,6 +200,36 @@ async function configureExtension(): Promise<void> {
     sidePanelBinding.disableGlobalPanel(),
     chrome.storage.session.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" }),
   ]);
+}
+
+async function cleanupDesignSessionBeforeRevoke(session: Readonly<ScanSession>): Promise<void> {
+  inFlightRequests.cancelRun(session.runId);
+  resourceBudgets.cancelRun(session.runId);
+  await designDebuggerCapture.cancelRun(session.runId);
+}
+
+function validDesignControllerPort(port: chrome.runtime.Port): string | undefined {
+  if (!port.name.startsWith(DESIGN_CONTROLLER_PORT_PREFIX)) return undefined;
+  const panelInstanceId = port.name.slice(DESIGN_CONTROLLER_PORT_PREFIX.length);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(panelInstanceId)) {
+    return undefined;
+  }
+  const sender = port.sender;
+  if (sender?.id !== chrome.runtime.id || sender.url === undefined) return undefined;
+  try {
+    const senderUrl = new URL(sender.url);
+    const sidePanelRoot = new URL("sidepanel/", chrome.runtime.getURL("/"));
+    if (
+      senderUrl.protocol !== sidePanelRoot.protocol ||
+      senderUrl.host !== sidePanelRoot.host ||
+      !senderUrl.pathname.startsWith(sidePanelRoot.pathname)
+    ) {
+      return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+  return panelInstanceId;
 }
 
 async function openPanelFromAction(
@@ -188,6 +267,7 @@ async function handleMessage(
     const established = await sessionManager.establishSession(
       {
         windowId: message.windowId,
+        ...(message.targetTabId === undefined ? {} : { tabId: message.targetTabId }),
         panelInstanceId: message.panelInstanceId,
       },
       sender,
@@ -231,6 +311,7 @@ async function handleMessage(
   if (message.type === "M0_REVOKE_SESSION") {
     inFlightRequests.cancelRun(handle.runId);
     resourceBudgets.cancelRun(handle.runId);
+    await designDebuggerCapture.cancelRun(handle.runId);
     const revoked = await sessionManager.revoke(handle.runId);
     return revoked
       ? { ok: true, bootId, revoked: true }
@@ -287,6 +368,215 @@ async function handleMessage(
     };
   }
 
+  if (message.type === "DESIGN_V2_BEGIN_VIEWPORT_CAPTURE") {
+    try {
+      const positionInjection = await chrome.scripting.executeScript<
+        [{ expectedOrigin: string; expectedPathname: string }],
+        ReturnType<typeof readCaptureScrollPosition>
+      >({
+        target: { tabId: session.tabId, frameIds: [0] },
+        world: "ISOLATED",
+        func: readCaptureScrollPosition,
+        args: [{ expectedOrigin: session.origin, expectedPathname: session.pathname }],
+      });
+      const position = readInjectionResult(positionInjection, session.documentId);
+      if (position === undefined || !position.ok) {
+        return fail("authorization_race", "无法在模拟视口前保存原滚动位置");
+      }
+      const viewport = await designDebuggerCapture.begin(
+        session.tabId,
+        handle.runId,
+        message.viewportName,
+      );
+      const afterAttach = await sessionManager.validateForExecution(handle);
+      if (!afterAttach.ok) {
+        await designDebuggerCapture.cancelTab(session.tabId);
+        return fail(afterAttach.reason, sessionFailureMessage(afterAttach.reason));
+      }
+      return {
+        ok: true,
+        bootId,
+        session: sessionSummary(afterAttach.session),
+        viewport: {
+          width: viewport.width,
+          height: viewport.height,
+          devicePixelRatio: viewport.deviceScaleFactor,
+        },
+        originalScrollY: position.scrollY,
+      };
+    } catch (error: unknown) {
+      return fail(
+        "debugger_attach_failed",
+        `无法启动统一视口采集：${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  if (message.type === "DESIGN_V2_END_VIEWPORT_CAPTURE") {
+    try {
+      await designDebuggerCapture.end(session.tabId, handle.runId);
+    } catch (error: unknown) {
+      return fail(
+        "debugger_detach_failed",
+        `无法恢复浏览器视口：${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    return {
+      ok: true,
+      bootId,
+      session: sessionSummary(session),
+    };
+  }
+
+  if (message.type === "DESIGN_V2_PREPARE_CAPTURE") {
+    await waitForMs(650);
+    const graphInjection = await chrome.scripting.executeScript<
+      [{ expectedOrigin: string; expectedPathname: string }],
+      RedactedComponentProbeResult
+    >({
+      target: { tabId: session.tabId, frameIds: [0] },
+      world: "ISOLATED",
+      func: redactedComponentGraphProbe,
+      args: [{ expectedOrigin: session.origin, expectedPathname: session.pathname }],
+    });
+    const graph = readInjectionResult(graphInjection, session.documentId);
+    if (graph === undefined || !graph.ok) {
+      return fail("invalid_probe_result", "脱敏组件图未通过页面身份校验");
+    }
+    const afterGraph = await sessionManager.validateForExecution(handle);
+    if (!afterGraph.ok) return fail(afterGraph.reason, sessionFailureMessage(afterGraph.reason));
+    return {
+      ok: true,
+      bootId,
+      session: sessionSummary(afterGraph.session),
+      graph,
+    };
+  }
+
+  if (
+    message.type === "DESIGN_V2_CAPTURE_CHECKPOINT" ||
+    message.type === "DESIGN_V2_RESTORE_SCROLL"
+  ) {
+    if (
+      !Number.isFinite(message.scrollY) ||
+      message.scrollY < 0 ||
+      message.scrollY > 200_000
+    ) {
+      return fail("invalid_request", "滚动检查点超出安全范围");
+    }
+    const settleMs =
+      message.type === "DESIGN_V2_CAPTURE_CHECKPOINT" ? message.settleMs : 0;
+    if (!Number.isFinite(settleMs) || settleMs < 0 || settleMs > 2_000) {
+      return fail("invalid_request", "稳定等待时间超出安全范围");
+    }
+    const checkpointInjection = await chrome.scripting.executeScript<
+      [{ expectedOrigin: string; expectedPathname: string; scrollY: number; settleMs: number }],
+      ReturnType<typeof scrollCaptureCheckpoint>
+    >({
+      target: { tabId: session.tabId, frameIds: [0] },
+      world: "ISOLATED",
+      func: scrollCaptureCheckpoint,
+      args: [{
+        expectedOrigin: session.origin,
+        expectedPathname: session.pathname,
+        scrollY: message.scrollY,
+        settleMs,
+      }],
+    });
+    const checkpoint = readInjectionResult(checkpointInjection, session.documentId);
+    if (checkpoint === undefined || !checkpoint.ok) {
+      return fail("authorization_race", "页面在滚动检查点期间发生变化");
+    }
+    if (settleMs > 0) await waitForMs(settleMs);
+    const afterScroll = await sessionManager.validateForExecution(handle);
+    if (!afterScroll.ok) return fail(afterScroll.reason, sessionFailureMessage(afterScroll.reason));
+
+    if (message.type === "DESIGN_V2_RESTORE_SCROLL") {
+      return {
+        ok: true,
+        bootId,
+        session: sessionSummary(afterScroll.session),
+        restoredScrollY: checkpoint.scrollY,
+      };
+    }
+
+    const settledCheckpointInjection = await chrome.scripting.executeScript<
+      [{ expectedOrigin: string; expectedPathname: string }],
+      ReturnType<typeof readSettledCaptureCheckpoint>
+    >({
+      target: { tabId: session.tabId, frameIds: [0] },
+      world: "ISOLATED",
+      func: readSettledCaptureCheckpoint,
+      args: [{ expectedOrigin: session.origin, expectedPathname: session.pathname }],
+    });
+    const settledCheckpoint = readInjectionResult(
+      settledCheckpointInjection,
+      session.documentId,
+    );
+    if (settledCheckpoint === undefined || !settledCheckpoint.ok) {
+      return fail("authorization_race", "页面在截图稳定检查期间发生变化");
+    }
+
+    let graph: RedactedComponentProbeResult | undefined;
+    if (message.includeGraph) {
+      const graphInjection = await chrome.scripting.executeScript<
+        [{ expectedOrigin: string; expectedPathname: string }],
+        RedactedComponentProbeResult
+      >({
+        target: { tabId: session.tabId, frameIds: [0] },
+        world: "ISOLATED",
+        func: redactedComponentGraphProbe,
+        args: [{ expectedOrigin: session.origin, expectedPathname: session.pathname }],
+      });
+      graph = readInjectionResult(graphInjection, session.documentId);
+      if (graph === undefined || !graph.ok) {
+        return fail("invalid_probe_result", "脱敏组件图未通过页面身份校验");
+      }
+    }
+    const screenshotDataUrl = await designDebuggerCapture.capturePngDataUrl(
+      session.tabId,
+      handle.runId,
+    );
+    if (!screenshotDataUrl.startsWith("data:image/png;base64,")) {
+      return fail("capture_failed", "可见区域截图返回格式无效");
+    }
+    const postScreenshotCheckpointInjection = await chrome.scripting.executeScript<
+      [{ expectedOrigin: string; expectedPathname: string }],
+      ReturnType<typeof readSettledCaptureCheckpoint>
+    >({
+      target: { tabId: session.tabId, frameIds: [0] },
+      world: "ISOLATED",
+      func: readSettledCaptureCheckpoint,
+      args: [{ expectedOrigin: session.origin, expectedPathname: session.pathname }],
+    });
+    const postScreenshotCheckpoint = readInjectionResult(
+      postScreenshotCheckpointInjection,
+      session.documentId,
+    );
+    if (postScreenshotCheckpoint === undefined || !postScreenshotCheckpoint.ok) {
+      return fail("authorization_race", "页面在截图后身份校验期间发生变化");
+    }
+    const captureStability = compareCaptureMetrics(
+      settledCheckpoint,
+      postScreenshotCheckpoint,
+    );
+    if (!captureStability.ok) {
+      return captureStability.reason === "capture_drift"
+        ? fail("capture_drift", `页面在截图期间发生视口或滚动漂移（${captureStability.changedMetrics.join("、")}）`)
+        : fail("coverage_drift", `页面在截图期间发生内容高度变化（${captureStability.changedMetrics.join("、")}）`);
+    }
+    const afterCapture = await sessionManager.validateForExecution(handle);
+    if (!afterCapture.ok) return fail(afterCapture.reason, sessionFailureMessage(afterCapture.reason));
+    return {
+      ok: true,
+      bootId,
+      session: sessionSummary(afterCapture.session),
+      checkpoint: captureStability.checkpoint,
+      screenshotDataUrl,
+      ...(graph === undefined ? {} : { graph }),
+    };
+  }
+
   if (message.type === "M0_RUN_PROBES") {
     if (message.scanId !== undefined && !isValidScanId(message.scanId)) {
       return fail("invalid_request", "scanId 格式无效");
@@ -301,7 +591,7 @@ async function handleMessage(
             windowId: session.windowId,
           });
     try {
-      const [mainAttempt, collectorAttempt] = await Promise.allSettled([
+      const [mainAttempt, collectorAttempt, designAttempt] = await Promise.allSettled([
         chrome.scripting.executeScript<[], ShopifyProbeResult | null>({
           target: { tabId: session.tabId, frameIds: [0] },
           world: "MAIN",
@@ -314,6 +604,20 @@ async function handleMessage(
           target: { tabId: session.tabId, frameIds: [0] },
           world: "ISOLATED",
           func: collectorProbe,
+          args: [
+            {
+              expectedOrigin: session.origin,
+              expectedPathname: session.pathname,
+            },
+          ],
+        }),
+        chrome.scripting.executeScript<
+          [{ expectedOrigin: string; expectedPathname: string }],
+          DesignProbeResult
+        >({
+          target: { tabId: session.tabId, frameIds: [0] },
+          world: "ISOLATED",
+          func: designIntelligenceProbe,
           args: [
             {
               expectedOrigin: session.origin,
@@ -351,6 +655,30 @@ async function handleMessage(
         }
       }
 
+      // Design Intelligence is an experimental, best-effort module. Injection
+      // or payload failures must not weaken Collector authorization or prevent
+      // the catalog/frontend modules from completing.
+      let design: DesignIntelligenceResult = emptyDesignIntelligence(
+        designAttempt.status === "rejected"
+          ? "probe_injection_failed"
+          : "invalid_probe_result",
+      );
+      if (designAttempt.status === "fulfilled") {
+        const candidate = readInjectionResult(
+          designAttempt.value,
+          session.documentId,
+        );
+        if (
+          candidate !== undefined &&
+          isDesignIntelligenceResult(candidate, {
+            origin: session.origin,
+            pathname: session.pathname,
+          })
+        ) {
+          design = candidate;
+        }
+      }
+
       const afterProbe = await sessionManager.validateForExecution(handle);
       if (!afterProbe.ok) {
         return fail(afterProbe.reason, sessionFailureMessage(afterProbe.reason));
@@ -385,6 +713,7 @@ async function handleMessage(
         session: sessionSummary(afterRegistration.session),
         main,
         collector,
+        design,
         resources,
       };
     } finally {
@@ -644,6 +973,11 @@ function isM0Message(value: unknown): value is M0Request {
     "M3_FINISH_RESOURCE_SCAN",
     "M1_CANCEL_SCAN",
     "M0_REVOKE_SESSION",
+    "DESIGN_V2_BEGIN_VIEWPORT_CAPTURE",
+    "DESIGN_V2_PREPARE_CAPTURE",
+    "DESIGN_V2_CAPTURE_CHECKPOINT",
+    "DESIGN_V2_RESTORE_SCROLL",
+    "DESIGN_V2_END_VIEWPORT_CAPTURE",
     "M0_GET_BOOT_ID",
   ].includes(value.type);
 }
@@ -957,6 +1291,10 @@ function fail(
     ...(diagnostic === undefined ? {} : { diagnostic }),
     message,
   };
+}
+
+function waitForMs(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function panelSenderDiagnostic(sender: MessageSenderLike): Record<string, unknown> {

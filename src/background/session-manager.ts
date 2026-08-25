@@ -26,6 +26,8 @@ export type ScanSession = {
   panelDocumentId?: string;
   /** SHA-256 of the in-memory panel nonce; the raw nonce is never persisted. */
   panelInstanceHash?: string;
+  /** Narrow mode for an explicitly targeted extension-owned capture controller. */
+  detachedController?: true;
   windowId: number;
   tabId: number;
   documentId: string;
@@ -77,6 +79,8 @@ export type DerivedResourceRegistrationResult =
 
 export type EstablishSessionCandidate = {
   windowId: number;
+  /** Optional explicit active tab used by the detached capture controller. */
+  tabId?: number;
   panelInstanceId?: string;
   /** If absent, the manager creates a cryptographically random run id. */
   runId?: string;
@@ -159,6 +163,8 @@ export type SessionManagerOptions = {
   now?: () => number;
   randomBytes?: (length: number) => Uint8Array;
 };
+
+export type BeforeSessionRevoke = (session: Readonly<ScanSession>) => Promise<void>;
 
 type InspectedUrl = {
   origin: string;
@@ -248,7 +254,13 @@ export class SessionManager {
     if (!Number.isSafeInteger(candidate.windowId) || candidate.windowId < 0) {
       return { ok: false, reason: "invalid_request" };
     }
-    if (!(await this.#isFocusedWindow(candidate.windowId))) {
+    if (panelBinding.detachedController === true && candidate.tabId === undefined) {
+      return { ok: false, reason: "invalid_request" };
+    }
+    if (
+      panelBinding.detachedController !== true &&
+      !(await this.#isFocusedWindow(candidate.windowId))
+    ) {
       return { ok: false, reason: "invalid_window" };
     }
 
@@ -270,20 +282,31 @@ export class SessionManager {
       return { ok: false, reason: "storage_error" };
     }
 
-    let matchingTabs: TabLike[];
-    try {
-      matchingTabs = await this.#api.tabs.query({
-        active: true,
-        windowId: candidate.windowId,
-      });
-    } catch {
-      return { ok: false, reason: "no_active_tab" };
+    let tab: TabLike | undefined;
+    if (candidate.tabId !== undefined) {
+      if (!Number.isSafeInteger(candidate.tabId) || candidate.tabId < 0) {
+        return { ok: false, reason: "invalid_request" };
+      }
+      try {
+        tab = await this.#api.tabs.get(candidate.tabId);
+      } catch {
+        return { ok: false, reason: "no_active_tab" };
+      }
+    } else {
+      let matchingTabs: TabLike[];
+      try {
+        matchingTabs = await this.#api.tabs.query({
+          active: true,
+          windowId: candidate.windowId,
+        });
+      } catch {
+        return { ok: false, reason: "no_active_tab" };
+      }
+      if (matchingTabs.length !== 1) {
+        return { ok: false, reason: "no_active_tab" };
+      }
+      tab = matchingTabs[0];
     }
-    if (matchingTabs.length !== 1) {
-      return { ok: false, reason: "no_active_tab" };
-    }
-
-    const tab = matchingTabs[0];
     if (
       tab === undefined ||
       !Number.isSafeInteger(tab.id) ||
@@ -564,29 +587,47 @@ export class SessionManager {
     });
   }
 
-  async revokeByTab(tabId: number): Promise<number> {
-    return this.#revokeMatching((session) => session.tabId === tabId);
+  async revokeByTab(tabId: number, beforeRevoke?: BeforeSessionRevoke): Promise<number> {
+    return this.#revokeMatching((session) => session.tabId === tabId, beforeRevoke);
   }
 
-  async revokeByWindow(windowId: number): Promise<number> {
-    return this.#revokeMatching((session) => session.windowId === windowId);
+  async revokeByWindow(windowId: number, beforeRevoke?: BeforeSessionRevoke): Promise<number> {
+    return this.#revokeMatching((session) => session.windowId === windowId, beforeRevoke);
   }
 
-  async revokeOutsideWindow(windowId: number): Promise<number> {
-    return this.#revokeMatching((session) => session.windowId !== windowId);
+  async revokeOutsideWindow(windowId: number, beforeRevoke?: BeforeSessionRevoke): Promise<number> {
+    return this.#revokeMatching(
+      (session) => session.detachedController !== true && session.windowId !== windowId,
+      beforeRevoke,
+    );
+  }
+
+  /** A transient WINDOW_ID_NONE must not destroy a detached controller session. */
+  async revokeOnFocusLoss(beforeRevoke?: BeforeSessionRevoke): Promise<number> {
+    return this.#revokeMatching(
+      (session) => session.detachedController !== true,
+      beforeRevoke,
+    );
   }
 
   async revokeAll(): Promise<number> {
     return this.#revokeMatching(() => true);
   }
 
-  async revokeByPanelDocument(panelDocumentId: string): Promise<number> {
+  async revokeByPanelDocument(
+    panelDocumentId: string,
+    beforeRevoke?: BeforeSessionRevoke,
+  ): Promise<number> {
     return this.#revokeMatching(
       (session) => session.panelDocumentId === panelDocumentId,
+      beforeRevoke,
     );
   }
 
-  async revokeByPanelInstance(panelInstanceId: string): Promise<number> {
+  async revokeByPanelInstance(
+    panelInstanceId: string,
+    beforeRevoke?: BeforeSessionRevoke,
+  ): Promise<number> {
     if (!PANEL_INSTANCE_PATTERN.test(panelInstanceId)) return 0;
     let panelInstanceHash: string;
     try {
@@ -596,13 +637,19 @@ export class SessionManager {
     }
     return this.#revokeMatching(
       (session) => session.panelInstanceHash === panelInstanceHash,
+      beforeRevoke,
     );
   }
 
   /** Intended for tabs.onActivated: all prior targets in that window expire. */
-  async revokeInactiveForWindow(windowId: number, activeTabId: number): Promise<number> {
+  async revokeInactiveForWindow(
+    windowId: number,
+    activeTabId: number,
+    beforeRevoke?: BeforeSessionRevoke,
+  ): Promise<number> {
     return this.#revokeMatching(
       (session) => session.windowId === windowId && session.tabId !== activeTabId,
+      beforeRevoke,
     );
   }
 
@@ -616,11 +663,10 @@ export class SessionManager {
     sender: MessageSenderLike,
     panelInstanceId?: string,
   ): Promise<
-    Pick<ScanSession, "panelDocumentId" | "panelInstanceHash"> | undefined
+    Pick<ScanSession, "panelDocumentId" | "panelInstanceHash" | "detachedController"> | undefined
   > {
     if (
       sender.id !== this.#api.runtime.id ||
-      sender.tab !== undefined ||
       sender.url === undefined
     ) {
       return undefined;
@@ -641,6 +687,15 @@ export class SessionManager {
     ) {
       return undefined;
     }
+    const detachedController = senderUrl.searchParams.get("detachedCapture") === "1";
+    if (
+      sender.tab !== undefined &&
+      !(
+        detachedController &&
+        sender.frameId === 0 &&
+        sender.tab.url === sender.url
+      )
+    ) return undefined;
 
     const hasDocumentId =
       typeof sender.documentId === "string" && sender.documentId.length > 0;
@@ -656,6 +711,7 @@ export class SessionManager {
         ...(hasPanelInstance
           ? { panelInstanceHash: await hashPanelInstanceId(panelInstanceId) }
           : {}),
+        ...(detachedController ? { detachedController: true as const } : {}),
       };
     } catch {
       return undefined;
@@ -747,7 +803,10 @@ export class SessionManager {
     session: ScanSession,
     checkDocument: boolean,
   ): Promise<SessionValidationResult> {
-    if (!(await this.#isFocusedWindow(session.windowId))) {
+    if (
+      session.detachedController !== true &&
+      !(await this.#isFocusedWindow(session.windowId))
+    ) {
       return { ok: false, reason: "invalid_window" };
     }
 
@@ -811,7 +870,10 @@ export class SessionManager {
     return { ok: false, reason };
   }
 
-  async #revokeMatching(predicate: (session: ScanSession) => boolean): Promise<number> {
+  async #revokeMatching(
+    predicate: (session: ScanSession) => boolean,
+    beforeRevoke?: BeforeSessionRevoke,
+  ): Promise<number> {
     let stored: Record<string, unknown>;
     try {
       stored = await this.#api.storage.session.get(null);
@@ -833,6 +895,17 @@ export class SessionManager {
 
     let removed = 0;
     for (const runId of runIdsToRemove) {
+      const session = Object.values(stored).find(
+        (value): value is ScanSession => isScanSession(value) && value.runId === runId,
+      );
+      if (session === undefined) continue;
+      try {
+        await beforeRevoke?.(session);
+      } catch {
+        // The credential must remain revocable while debugger restoration is
+        // pending. A later lifecycle event can retry the guarded revoke.
+        continue;
+      }
       if (await this.revoke(runId)) removed += 1;
     }
     if (corruptKeysToRemove.length > 0) {
@@ -969,6 +1042,9 @@ function isScanSession(value: unknown): value is ScanSession {
     typeof candidate.expiresAt !== "string" ||
     candidate.state !== "active"
   ) {
+    return false;
+  }
+  if (candidate.detachedController !== undefined && candidate.detachedController !== true) {
     return false;
   }
 

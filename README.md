@@ -1,8 +1,16 @@
-# SS Watcher
+# SS Watcher — Design Intelligence Preview
 
-M0–M3 已完成：本机 MV3 Side Panel 扩展能够识别 Shopify 与 `storefrontKind`，匿名扫描公开产品目录，核验 market/currency/价格来源，生成公开畅销排序、A–D 上新证据和店铺统计，并提供正式产品表及安全的 CSV/JSON 导出。M3 Frontend Intelligence 的受限资源清单、同源公开文本哈希、external source-map 派生、轻量静态分析、40 条稳定 App/Pixel 规则、Technology 页面，以及与普通快照隔离的显式公开源码导出均已通过自动门禁和最终 Chrome 验收。
+> 当前分支：`codex/design-intelligence-preview`。Gate 4 已通过 TourBox 真实取证与隔离盲复刻验收；Gate 5 的第二类站点泛化尚未完成，因此暂不并入稳定 `main`。
 
-设计基线见 `docs/DESIGN.md`；阶段证据见 `docs/spikes.md`、`docs/m1.md`、`docs/m2.md`、`docs/m3.md`。
+这套预览能力面向“参考公开网页 → 可交给编码 Agent 的 UI/UX 证据包 → 隔离环境复刻”。它采集三档 viewport 的截图、脱敏结构与设计 token，并记录由用户亲自触发的前后交互状态；SS Watcher 不替用户点击、悬停、输入、提交或导航。输出为严格校验、可移植的 `.ssw-design` 包。
+
+TourBox 试点的默认页、桌面 mega menu、平板/手机导航抽屉已经完成真实取证。隔离盲复刻在 1440、768、390 CSS px 下通过结构覆盖与约 85–90% 视觉目标带验收。这个结果只证明当前试点，不代表任意网站都能达到相同还原度。
+
+实现边界、试用方法与验收状态见：
+
+- [`docs/design-intelligence-spike.md`](docs/design-intelligence-spike.md)：同事试用入口与安全边界；
+- [`docs/design-intelligence-gate4.md`](docs/design-intelligence-gate4.md)：交互证据与盲复刻验收合同；
+- [`docs/design-intelligence-v2-progress.md`](docs/design-intelligence-v2-progress.md)：逐项实测证据与已知限制。
 
 ## 环境要求
 
@@ -13,13 +21,19 @@ M0–M3 已完成：本机 MV3 Side Panel 扩展能够识别 Shopify 与 `storef
 ## 获取与构建
 
 ```bash
-git clone https://github.com/z285chen/ss-watcher.git
+git clone --branch codex/design-intelligence-preview https://github.com/z285chen/ss-watcher.git
 cd ss-watcher
 npm ci
 npm test
 npm run build
 npm run test:m3-fingerprints
 ```
+
+构建后在 Chrome 扩展管理页加载 `dist/`。只在获准测试的公开页面点击扩展图标；Design Intelligence 的三档截图会临时使用受限 `debugger` 权限进行 viewport 模拟，并在成功、失败或取消时清理模拟状态并断开连接。真实站点证据包和复刻输出默认位于被 Git 忽略的 `validation/.artifacts/`，不会随仓库分发。
+
+## 原有店铺分析能力
+
+M0–M3 已完成：扩展能够识别 Shopify 与 `storefrontKind`，匿名扫描公开产品目录，核验 market/currency/价格来源，生成公开畅销排序、A–D 上新证据和店铺统计，并提供 CSV/JSON 导出。设计基线见 `docs/DESIGN.md`；阶段证据见 `docs/spikes.md`、`docs/m1.md`、`docs/m2.md`、`docs/m3.md`。
 
 本机双端口网络 fixture：
 

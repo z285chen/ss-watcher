@@ -11,6 +11,7 @@ import type {
 } from "../../src/core/network/request-policy";
 import type { EndpointExecutor } from "../../src/core/shopify/catalog-scanner";
 import type { FrontendIntelligenceResult } from "../../src/core/frontend/frontend-intelligence";
+import type { DesignIntelligenceResult } from "../../src/core/design/design-intelligence";
 
 const stores: StagingStore[] = [];
 const origin = "https://store.example";
@@ -94,6 +95,7 @@ describe("persisted M1+M2 storefront scan", () => {
       }),
       execute,
       frontend: frontendFixture(),
+      design: designFixture(),
     });
 
     expect(result.scan).toMatchObject({
@@ -141,6 +143,11 @@ describe("persisted M1+M2 storefront scan", () => {
         analyzerVersion: "token-url-v2",
         fingerprintRulesVersion: "public-signals-v1.0.0",
       }),
+      design: expect.objectContaining({
+        status: "completed",
+        analyzerVersion: "computed-style-spike-v1",
+        coverage: expect.objectContaining({ sampledElements: 8 }),
+      }),
       resources: [
         expect.objectContaining({
           resourceId: "00000000-0000-4000-8000-000000000001",
@@ -167,6 +174,10 @@ describe("persisted M1+M2 storefront scan", () => {
         expect.objectContaining({ moduleId: "newness", status: "partial" }),
         expect.objectContaining({
           moduleId: "frontend-intelligence",
+          status: "completed",
+        }),
+        expect.objectContaining({
+          moduleId: "design-intelligence",
           status: "completed",
         }),
       ]),
@@ -266,6 +277,7 @@ describe("persisted M1+M2 storefront scan", () => {
         ],
       }),
       execute,
+      design: failedDesignFixture(),
     });
 
     expect(result.scan.catalog.products).toEqual([
@@ -276,6 +288,23 @@ describe("persisted M1+M2 storefront scan", () => {
       productKey: "101",
       value: { id: "101", handle: "alpha" },
     });
+    expect(result.committed.snapshot).toMatchObject({
+      scanStatus: result.scan.status,
+      design: {
+        status: "failed",
+        errors: ["probe_injection_failed"],
+      },
+    });
+    expect(result.committed.snapshot.scanStatus).not.toBe("failed");
+    expect(result.committed.moduleResults).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          moduleId: "design-intelligence",
+          status: "failed",
+          errors: ["probe_injection_failed"],
+        }),
+      ]),
+    );
   });
 
   it("defers a products.json handle-only identity until a later page reveals its ID", async () => {
@@ -457,6 +486,59 @@ function frontendFixture(): FrontendIntelligenceResult {
     resources: [resource],
     findings: [],
     errors: [],
+  };
+}
+
+function designFixture(): DesignIntelligenceResult {
+  return {
+    status: "completed",
+    analyzerVersion: "computed-style-spike-v1",
+    capture: {
+      origin,
+      pathname: "/",
+      capturedAt: "2026-08-12T00:00:00.000Z",
+      viewport: {
+        width: 1_280,
+        height: 720,
+        devicePixelRatio: 2,
+        colorScheme: "light",
+      },
+    },
+    coverage: {
+      visitedElements: 10,
+      visibleElements: 8,
+      sampledElements: 8,
+      visitLimit: 5_000,
+      elementLimit: 1_500,
+      truncated: false,
+      styleSheetsObserved: 1,
+      styleSheetsReadable: 1,
+      styleSheetsBlocked: 0,
+      openShadowRoots: 0,
+      durationMs: 12,
+    },
+    layout: [],
+    primitives: {
+      colors: [],
+      typography: [],
+      spacing: [],
+      radii: [],
+      shadows: [],
+      cssVariables: [],
+      breakpoints: [],
+    },
+    components: [],
+    warnings: [],
+    errors: [],
+  };
+}
+
+function failedDesignFixture(): DesignIntelligenceResult {
+  return {
+    status: "failed",
+    analyzerVersion: "computed-style-spike-v1",
+    warnings: [],
+    errors: ["probe_injection_failed"],
   };
 }
 

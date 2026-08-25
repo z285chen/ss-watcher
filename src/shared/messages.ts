@@ -10,6 +10,8 @@ import type {
   ResourceDescriptor,
   ResourceFetchResult,
 } from "../core/frontend/resource-types";
+import type { DesignIntelligenceResult } from "../core/design/design-intelligence";
+import type { RedactedComponentProbeResult } from "../content/redacted-component-probe";
 
 export type SessionHandle = {
   runId: string;
@@ -38,6 +40,7 @@ export type M0Request =
   | {
       type: "M0_ESTABLISH_SESSION";
       windowId: number;
+      targetTabId?: number;
       panelInstanceId: string;
     }
   | {
@@ -84,6 +87,36 @@ export type M0Request =
       handle: SessionHandle;
       panelInstanceId: string;
     }
+  | {
+      type: "DESIGN_V2_BEGIN_VIEWPORT_CAPTURE";
+      handle: SessionHandle;
+      panelInstanceId: string;
+      viewportName: "desktop" | "tablet" | "mobile";
+    }
+  | {
+      type: "DESIGN_V2_PREPARE_CAPTURE";
+      handle: SessionHandle;
+      panelInstanceId: string;
+    }
+  | {
+      type: "DESIGN_V2_CAPTURE_CHECKPOINT";
+      handle: SessionHandle;
+      panelInstanceId: string;
+      scrollY: number;
+      settleMs: number;
+      includeGraph: boolean;
+    }
+  | {
+      type: "DESIGN_V2_RESTORE_SCROLL";
+      handle: SessionHandle;
+      panelInstanceId: string;
+      scrollY: number;
+    }
+  | {
+      type: "DESIGN_V2_END_VIEWPORT_CAPTURE";
+      handle: SessionHandle;
+      panelInstanceId: string;
+    }
   | { type: "M0_GET_BOOT_ID" };
 
 export type M0ErrorResponse = {
@@ -109,6 +142,7 @@ export type ProbeResponse =
       session: SessionSummary;
       main: ShopifyProbeResult | null;
       collector: CollectorProbeResult;
+      design: DesignIntelligenceResult;
       resources: ResourceDescriptor[];
     }
   | M0ErrorResponse;
@@ -156,6 +190,57 @@ export type FinishResourceScanResponse =
 
 export type BootResponse = { ok: true; bootId: string } | M0ErrorResponse;
 
+export type DesignViewportLifecycleResponse =
+  | {
+      ok: true;
+      bootId: string;
+      session: SessionSummary;
+      viewport?: Readonly<{
+        width: number;
+        height: number;
+        devicePixelRatio: number;
+      }>;
+      originalScrollY?: number;
+    }
+  | M0ErrorResponse;
+
+export type DesignCaptureCheckpointResponse =
+  | {
+      ok: true;
+      bootId: string;
+      session: SessionSummary;
+      checkpoint: Readonly<{
+        scrollY: number;
+        width: number;
+        height: number;
+        devicePixelRatio: number;
+        documentHeight: number;
+        maximumScrollY: number;
+        atBottom: boolean;
+      }>;
+      screenshotDataUrl: string;
+      graph?: RedactedComponentProbeResult;
+    }
+  | M0ErrorResponse;
+
+export type DesignPrepareCaptureResponse =
+  | {
+      ok: true;
+      bootId: string;
+      session: SessionSummary;
+      graph: RedactedComponentProbeResult & { ok: true };
+    }
+  | M0ErrorResponse;
+
+export type DesignRestoreScrollResponse =
+  | {
+      ok: true;
+      bootId: string;
+      session: SessionSummary;
+      restoredScrollY: number;
+    }
+  | M0ErrorResponse;
+
 export type M0Response =
   | EstablishSessionResponse
   | ValidateSessionResponse
@@ -165,4 +250,8 @@ export type M0Response =
   | CancelScanResponse
   | FinishResourceScanResponse
   | RevokeResponse
+  | DesignViewportLifecycleResponse
+  | DesignPrepareCaptureResponse
+  | DesignCaptureCheckpointResponse
+  | DesignRestoreScrollResponse
   | BootResponse;

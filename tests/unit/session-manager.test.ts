@@ -177,6 +177,82 @@ describe("SessionManager", () => {
     expect(Object.keys(fixture.storage.values)).toHaveLength(1);
   });
 
+  it("binds an explicit active tab for a detached controller without querying another window", async () => {
+    const fixture = createFixture();
+    fixture.state.focusedWindowId = 8;
+    const controllerUrl = `${EXTENSION_ORIGIN}/sidepanel/index.html?detachedCapture=1`;
+    const result = await fixture.manager.establishSession(
+      { windowId: WINDOW_ID, tabId: 41 },
+      panelSender({
+        url: controllerUrl,
+        frameId: 0,
+        tab: { id: 99, windowId: 8, active: true, url: controllerUrl },
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.session.detachedController).toBe(true);
+    expect(fixture.get).toHaveBeenCalledWith(41);
+    expect(fixture.query).not.toHaveBeenCalled();
+  });
+
+  it("preserves only detached controller sessions across controller focus changes", async () => {
+    const fixture = createFixture();
+    await establish(fixture, "run-regular-focus");
+    const controllerUrl = `${EXTENSION_ORIGIN}/sidepanel/index.html?detachedCapture=1`;
+    const detached = await fixture.manager.establishSession(
+      { runId: "run-detached-focus", windowId: WINDOW_ID, tabId: 41 },
+      panelSender({
+        url: controllerUrl,
+        frameId: 0,
+        tab: { id: 99, windowId: WINDOW_ID + 1, active: true, url: controllerUrl },
+      }),
+    );
+    expect(detached.ok).toBe(true);
+
+    await expect(fixture.manager.revokeOutsideWindow(WINDOW_ID + 1)).resolves.toBe(1);
+    expect(Object.keys(fixture.storage.values)).toEqual([
+      `${SESSION_STORAGE_PREFIX}run-detached-focus`,
+    ]);
+    if (!detached.ok) return;
+    await expect(fixture.manager.validateForExecution(detached.handle)).resolves.toMatchObject({
+      ok: true,
+      session: { detachedController: true },
+    });
+  });
+
+  it("preserves detached controller sessions through transient total focus loss", async () => {
+    const fixture = createFixture();
+    await establish(fixture, "run-regular-none");
+    const controllerUrl = `${EXTENSION_ORIGIN}/sidepanel/index.html?detachedCapture=1`;
+    const detached = await fixture.manager.establishSession(
+      { runId: "run-detached-none", windowId: WINDOW_ID, tabId: 41 },
+      panelSender({
+        url: controllerUrl,
+        frameId: 0,
+        tab: { id: 99, windowId: WINDOW_ID + 1, active: true, url: controllerUrl },
+      }),
+    );
+    expect(detached.ok).toBe(true);
+
+    await expect(fixture.manager.revokeOnFocusLoss()).resolves.toBe(1);
+    expect(Object.keys(fixture.storage.values)).toEqual([
+      `${SESSION_STORAGE_PREFIX}run-detached-none`,
+    ]);
+  });
+
+  it("rejects a regular extension tab masquerading as a detached controller", async () => {
+    const fixture = createFixture();
+    const regularUrl = `${EXTENSION_ORIGIN}/sidepanel/index.html`;
+    await expect(fixture.manager.establishSession(
+      { windowId: WINDOW_ID, tabId: 41 },
+      panelSender({
+        url: regularUrl,
+        frameId: 0,
+        tab: { id: 99, windowId: 8, active: true, url: regularUrl },
+      }),
+    )).resolves.toEqual({ ok: false, reason: "invalid_panel_sender" });
+  });
+
   it("rejects sensitive paths before injecting or generating a token", async () => {
     const fixture = createFixture();
     fixture.state.tab.url = "https://shop.example/EN-ca/%63art/?x=1";
@@ -588,5 +664,68 @@ describe("SessionManager", () => {
     expect(Object.keys(fixture.storage.values)).toEqual([
       `${SESSION_STORAGE_PREFIX}run-new-active`,
     ]);
+  });
+
+  it("runs debugger cleanup before an inactive-tab session is revoked", async () => {
+    const fixture = createFixture();
+    await establish(fixture, "run-cleanup-order");
+    const events: string[] = [];
+    const originalRemove = fixture.storage.remove.bind(fixture.storage);
+    vi.spyOn(fixture.storage, "remove").mockImplementation(async (keys) => {
+      events.push("revoke");
+      await originalRemove(keys);
+    });
+
+    await expect(
+      fixture.manager.revokeInactiveForWindow(WINDOW_ID, 42, async (session) => {
+        events.push(`cleanup:${session.runId}`);
+      }),
+    ).resolves.toBe(1);
+    expect(events).toEqual(["cleanup:run-cleanup-order", "revoke"]);
+    expect(fixture.storage.values).toEqual({});
+  });
+
+  it("retains a guarded session when cleanup fails and revokes it on retry", async () => {
+    const fixture = createFixture();
+    await establish(fixture, "run-cleanup-retry");
+    const cleanup = vi
+      .fn<(session: Readonly<{ runId: string }>) => Promise<void>>()
+      .mockRejectedValueOnce(new Error("detach failed"))
+      .mockResolvedValueOnce(undefined);
+
+    await expect(
+      fixture.manager.revokeInactiveForWindow(WINDOW_ID, 42, cleanup),
+    ).resolves.toBe(0);
+    expect(fixture.storage.values).toHaveProperty(
+      `${SESSION_STORAGE_PREFIX}run-cleanup-retry`,
+    );
+
+    await expect(
+      fixture.manager.revokeInactiveForWindow(WINDOW_ID, 42, cleanup),
+    ).resolves.toBe(1);
+    expect(cleanup).toHaveBeenCalledTimes(2);
+    expect(fixture.storage.values).toEqual({});
+  });
+
+  it("supports guarded panel-instance revocation for controller Port disconnect", async () => {
+    const fixture = createFixture();
+    const established = await fixture.manager.establishSession(
+      {
+        runId: "run-controller-port",
+        windowId: WINDOW_ID,
+        panelInstanceId: PANEL_INSTANCE_ID,
+      },
+      panelSender(),
+    );
+    expect(established.ok).toBe(true);
+    const cleanup = vi.fn(async () => undefined);
+
+    await expect(
+      fixture.manager.revokeByPanelInstance(PANEL_INSTANCE_ID, cleanup),
+    ).resolves.toBe(1);
+    expect(cleanup).toHaveBeenCalledWith(
+      expect.objectContaining({ runId: "run-controller-port" }),
+    );
+    expect(fixture.storage.values).toEqual({});
   });
 });

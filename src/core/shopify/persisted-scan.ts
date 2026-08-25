@@ -21,6 +21,10 @@ import {
   emptyFrontendIntelligence,
   type FrontendIntelligenceResult,
 } from "../frontend/frontend-intelligence";
+import {
+  emptyDesignIntelligence,
+  type DesignIntelligenceResult,
+} from "../design/design-intelligence";
 
 const STALE_RUN_AFTER_MS = 60_000;
 
@@ -35,6 +39,7 @@ export type PersistedScanInput = Omit<
     onProducts?: StorefrontScanInput["onProducts"];
     onStage?: (stage: PersistedScanStage) => void;
     frontend?: FrontendIntelligenceResult | Promise<FrontendIntelligenceResult>;
+    design?: DesignIntelligenceResult | Promise<DesignIntelligenceResult>;
   }>;
 
 export type PersistedScanResult = Readonly<{
@@ -67,6 +72,7 @@ export async function runPersistedStorefrontScan(
         "rankings",
         "newness",
         ...(input.frontend === undefined ? [] : ["frontend-intelligence"]),
+        ...(input.design === undefined ? [] : ["design-intelligence"]),
       ],
     });
     started = true;
@@ -209,6 +215,20 @@ export async function runPersistedStorefrontScan(
         ...(frontend.errors.length === 0 ? {} : { errors: frontend.errors }),
       });
     }
+    const design =
+      input.design === undefined
+        ? undefined
+        : await Promise.resolve(input.design).catch(() =>
+            emptyDesignIntelligence("probe_runtime_failed"),
+          );
+    if (design !== undefined) {
+      await input.store.writeModuleResult(scanRunId, {
+        moduleId: "design-intelligence",
+        status: designModuleStatus(design),
+        result: design,
+        ...(design.errors.length === 0 ? {} : { errors: design.errors }),
+      });
+    }
     const rankingRows = analysis.bestSelling.items.map((item) => ({
       ...item,
       scope: analysis.bestSelling.scope,
@@ -275,6 +295,7 @@ export async function runPersistedStorefrontScan(
                 finding.category === "app" || finding.category === "pixel",
             ),
           }),
+      ...(design === undefined ? {} : { design }),
       socials: input.collector.ok ? input.collector.socials : [],
       errors: analysisErrors,
     });
@@ -290,6 +311,19 @@ export async function runPersistedStorefrontScan(
       }
     }
     throw error;
+  }
+}
+
+function designModuleStatus(
+  design: DesignIntelligenceResult,
+): ModuleTerminalStatus {
+  switch (design.status) {
+    case "completed":
+      return "completed";
+    case "partial":
+      return "partial";
+    case "failed":
+      return "failed";
   }
 }
 
