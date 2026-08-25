@@ -4,8 +4,18 @@ M0–M3 已完成：本机 MV3 Side Panel 扩展能够识别 Shopify 与 `storef
 
 设计基线见 `docs/DESIGN.md`；阶段证据见 `docs/spikes.md`、`docs/m1.md`、`docs/m2.md`、`docs/m3.md`。
 
+## 环境要求
+
+- Node.js `^20.19.0` 或 `>=22.12.0`
+- npm（随受支持的 Node.js 版本安装）
+- Chrome 116 或更高版本
+
+## 获取与构建
+
 ```bash
-npm install
+git clone https://github.com/z285chen/ss-watcher.git
+cd ss-watcher
+npm ci
 npm test
 npm run build
 npm run test:m3-fingerprints
@@ -36,3 +46,7 @@ npm run test:m2-shopify-live
 6. 每次重新构建后，在扩展卡片点击「重新加载」再验收。扩展重载、跨站导航、切换标签或 Chrome 窗口失焦会按设计吊销旧会话，但不会删除已提交快照；同一店铺 origin 内导航保留面板可见性，重新点击扩展图标即可重新授权。
 
 边界：只处理匿名公开信息，固定 `credentials: "omit"`，不跟随重定向；跨源资源只保存元数据，原始源码默认不入 IndexedDB；不调用 PPSpy 私有接口，不复制其 UI/代码，不提供销量间谍、流量或广告历史。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。

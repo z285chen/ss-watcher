@@ -3,6 +3,9 @@
   "version": "0.3.0-m3",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
   "scripts": {
     "build": "tsc --noEmit && vite build",
     "dev": "vite",
