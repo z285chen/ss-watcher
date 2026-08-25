@@ -1,5 +1,21 @@
 # SS Watcher
 
+## Design Intelligence Preview：参考网页 UI/UX 证据与复刻
+
+本仓库当前对同事分享的重点是 [Design Intelligence Gate 4 预览分支](https://github.com/z285chen/ss-watcher/tree/codex/design-intelligence-preview)：将获准公开网页整理成严格校验的 `.ssw-design` 证据包，供隔离的编码 Agent 复刻页面视觉、响应式结构，以及由用户亲自确认的关键交互状态。
+
+```bash
+git clone --branch codex/design-intelligence-preview https://github.com/z285chen/ss-watcher.git
+cd ss-watcher
+npm ci
+npm test
+npm run build
+```
+
+TourBox 试点的默认页、桌面 mega menu、平板/手机导航抽屉已完成真实取证和隔离盲复刻验收；Gate 5 的第二类站点泛化尚未完成，因此该能力以 Preview 分支公开，暂不并入稳定 `main`。详细试用方式、证据合同与限制均在该分支 README 中。
+
+## 稳定 main：Shopify 店铺与前端分析
+
 M0–M3 已完成：本机 MV3 Side Panel 扩展能够识别 Shopify 与 `storefrontKind`，匿名扫描公开产品目录，核验 market/currency/价格来源，生成公开畅销排序、A–D 上新证据和店铺统计，并提供正式产品表及安全的 CSV/JSON 导出。M3 Frontend Intelligence 的受限资源清单、同源公开文本哈希、external source-map 派生、轻量静态分析、40 条稳定 App/Pixel 规则、Technology 页面，以及与普通快照隔离的显式公开源码导出均已通过自动门禁和最终 Chrome 验收。
 
 设计基线见 `docs/DESIGN.md`；阶段证据见 `docs/spikes.md`、`docs/m1.md`、`docs/m2.md`、`docs/m3.md`。
